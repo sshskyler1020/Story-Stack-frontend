@@ -1,0 +1,2336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Story Stack</title>
+
+
+<!-- ============================================================
+     FONTS
+     Fraunces (display) carries the literary/bookish personality.
+     Inter (body/UI) stays quiet so Fraunces reads as the voice.
+     JetBrains Mono (utility) marks anything ledger-like: prices,
+     order numbers, tracking codes — a nod to receipts & colophons.
+============================================================= -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+
+<!-- Reader engines — only exercised on the 'reader' page -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
+<!-- epub.js: cdnjs never actually hosted this version (only has up to
+     0.2.15) — jsDelivr's npm mirror does. -->
+<script src="https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js" defer></script>
+<!-- pdf.js: newer versions ship ES-module-only (.mjs) builds, which is
+     incompatible with a plain <script> global-variable usage — pinned to
+     the last version with a classic UMD build (window.pdfjsLib global). -->
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.min.js" defer></script>
+
+
+<!-- Firebase Web SDK v10 (modular, ESM via CDN) -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import {
+    getAuth, onAuthStateChanged, GoogleAuthProvider,
+    signInWithPopup, signInWithRedirect, getRedirectResult, signOut
+  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+
+
+  // ---- REPLACE with your project's Firebase config ----
+  const firebaseConfig = {
+    apiKey: "AIzaSyCTB_g8VH5pyYMzC3UonA2-W4-V6D6kg5E",
+    authDomain: "story-stack-474be.firebaseapp.com",
+    projectId: "story-stack-474be",
+    appId: "1:633152504871:web:db991c5de9f0c386c6ba02"
+  };
+
+
+  // If this still has placeholder values, every sign-in attempt will fail
+  // silently unless we call it out explicitly — this is the single most
+  // common reason "the sign-in button doesn't work" on a fresh copy of
+  // this file, so surface it loudly instead of letting Firebase's cryptic
+  // auth/invalid-api-key error die in the console.
+  const isPlaceholderConfig = Object.values(firebaseConfig).some((v) => v.startsWith('YOUR_'));
+
+
+  const app = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const provider = new GoogleAuthProvider();
+
+
+  // Errors that mean "popups don't work here" rather than "auth is broken" —
+  // this is exactly what happens for a lot of iframe embeds (Google Sites
+  // included): browsers routinely block window.open() from inside a
+  // cross-origin iframe, or Firebase itself detects the iframe context and
+  // throws auth/operation-not-supported-in-this-environment. Falling back
+  // to a full-page redirect flow sidesteps all of that.
+  const POPUP_FALLBACK_CODES = new Set([
+    'auth/operation-not-supported-in-this-environment',
+    'auth/popup-blocked',
+    'auth/popup-closed-by-user',
+    'auth/cancelled-popup-request',
+  ]);
+
+
+  async function signIn() {
+    if (isPlaceholderConfig) {
+      window.StoryStack.showAuthError(
+        'Sign-in isn\'t configured yet — this embed still has placeholder Firebase credentials. Replace firebaseConfig at the top of the file with your real project values.'
+      );
+      return;
+    }
+    try {
+      await signInWithPopup(auth, provider);
+    } catch (e) {
+      if (POPUP_FALLBACK_CODES.has(e.code)) {
+        console.warn('[auth] Popup sign-in unavailable in this context, falling back to redirect:', e.code);
+        try {
+          await signInWithRedirect(auth, provider); // navigates away; result is picked up below on reload
+        } catch (redirectErr) {
+          console.error('[auth] Redirect sign-in also failed:', redirectErr);
+          window.StoryStack.showAuthError(`Sign-in failed: ${redirectErr.message}`);
+        }
+      } else {
+        console.error('[auth] Sign-in failed:', e);
+        window.StoryStack.showAuthError(`Sign-in failed: ${e.message}`);
+      }
+    }
+  }
+
+
+  // Registers the current Firebase user as a Story Stack author (calls
+  // POST /api/author/register), then forces a fresh ID token so the
+  // isAuthor custom claim the server just set is picked up immediately —
+  // without this, the claim wouldn't appear until the next natural
+  // sign-in, leaving the Author Hub looking broken right after registering.
+  async function registerAsAuthor(displayName, bio) {
+    const user = auth.currentUser;
+    if (!user) return { ok: false, error: 'You need to sign in first.' };
+
+    try {
+      const idToken = await user.getIdToken();
+      const res = await fetch(`${window.STORY_STACK_API_BASE_URL}/api/author/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+        body: JSON.stringify({ displayName, bio }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Registration failed (${res.status})`);
+      }
+
+      // Custom claims set server-side via setCustomUserClaims() don't
+      // always propagate to Firebase's token-issuing servers instantly —
+      // an immediate force-refresh can occasionally still come back with
+      // the OLD claims even though registration genuinely succeeded. Retry
+      // with backoff instead of trusting a single attempt, so the UI
+      // doesn't silently get stuck showing the sign-up form.
+      let refreshed = await user.getIdTokenResult(true);
+      let attempts = 1;
+      const maxAttempts = 5;
+      const delays = [500, 800, 1200, 1800]; // ms between retries
+
+      while (refreshed.claims.isAuthor !== true && attempts < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, delays[attempts - 1] || 2000));
+        refreshed = await user.getIdTokenResult(true);
+        attempts++;
+      }
+
+      window.StoryStack.setUser({
+        uid: user.uid,
+        name: user.displayName || user.email,
+        email: user.email,
+        photoURL: user.photoURL,
+        idToken: refreshed.token,
+        isAuthor: refreshed.claims.isAuthor === true,
+      });
+
+      if (refreshed.claims.isAuthor !== true) {
+        // Registration itself succeeded (we already checked res.ok above)
+        // — this only means the claim hasn't propagated yet even after
+        // retrying. Tell the user plainly rather than looking broken.
+        return {
+          ok: true,
+          pending: true,
+          error: "Registration succeeded, but it's taking a bit longer than usual to activate — try refreshing the page in a few seconds.",
+        };
+      }
+
+      return { ok: true };
+    } catch (e) {
+      console.error('[author] Registration failed:', e);
+      return { ok: false, error: e.message };
+    }
+  }
+
+
+  window.StoryStackAuth = { signIn, signOut: () => signOut(auth), registerAsAuthor };
+
+
+  // Pick up the result of a signInWithRedirect() call after the page
+  // reloads. A no-op if the user arrived here any other way.
+  getRedirectResult(auth).catch((e) => {
+    console.error('[auth] getRedirectResult failed:', e);
+    window.StoryStack.showAuthError(`Sign-in failed: ${e.message}`);
+  });
+
+
+  // Re-evaluate the role-gated navbar + current page on every auth change.
+  onAuthStateChanged(auth, async (user) => {
+    if (!user) {
+      window.StoryStack.setUser(null);
+      return;
+    }
+    // force a token refresh so a just-granted isAuthor claim is picked up
+    // immediately after /api/author/register, per the claim-propagation note.
+    const tokenResult = await user.getIdTokenResult(true);
+    window.StoryStack.setUser({
+      uid: user.uid,
+      name: user.displayName || user.email,
+      email: user.email,
+      photoURL: user.photoURL,
+      idToken: tokenResult.token,
+      isAuthor: tokenResult.claims.isAuthor === true
+    });
+  });
+</script>
+
+
+<style>
+/* ============================================================
+   TOKENS
+============================================================= */
+:root{
+  --font-display:'Fraunces', serif;
+  --font-body:'Inter', system-ui, sans-serif;
+  --font-mono:'JetBrains Mono', monospace;
+
+
+  --bg:#FAF6EE;
+  --surface:#FFFFFF;
+  --surface-2:#F1EAD9;
+  --text:#2B2620;
+  --text-muted:#79705F;
+  --border:#E3D9C4;
+  --accent-gold:#B8892B;
+  --accent-gold-ink:#8C6A1F;
+  --accent-green:#3F5D48;
+  --accent-red:#8B3A3A;
+  --shadow:rgba(43,38,32,0.12);
+  --radius:10px;
+}
+:root[data-theme="dark"]{
+  --bg:#14161C;
+  --surface:#1D2029;
+  --surface-2:#262A35;
+  --text:#EDE6D6;
+  --text-muted:#A79E8C;
+  --border:#333847;
+  --accent-gold:#D9AE4E;
+  --accent-gold-ink:#F0CB78;
+  --accent-green:#5B8A6C;
+  --accent-red:#C1615F;
+  --shadow:rgba(0,0,0,0.45);
+}
+
+
+*,*::before,*::after{ box-sizing:border-box; }
+html,body{ margin:0; padding:0; overflow-x:hidden; max-width:100%; }
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:var(--font-body);
+  -webkit-font-smoothing:antialiased;
+  transition:background .25s ease,color .25s ease;
+  min-height:100vh;
+}
+a{ color:inherit; }
+button{ font-family:inherit; cursor:pointer; }
+h1,h2,h3{ font-family:var(--font-display); margin:0 0 .4em; letter-spacing:-0.01em; }
+.mono{ font-family:var(--font-mono); }
+:focus-visible{ outline:2px solid var(--accent-gold); outline-offset:2px; }
+@media (prefers-reduced-motion: reduce){ *{ animation-duration:0.001ms !important; transition-duration:0.001ms !important; } }
+
+
+/* ============================================================
+   SIGNATURE ELEMENT — the "spine stack" mark.
+   A row of book-spine bars of uneven height, leaning together.
+   Used as the logo, and reused (animated) as the loading state —
+   the bars breathe like an equalizer instead of a generic spinner.
+============================================================= */
+.spine-mark{ display:inline-flex; align-items:flex-end; gap:2px; height:22px; }
+.spine-mark span{
+  width:4px; border-radius:2px 2px 0 0; display:block;
+  background:var(--accent-gold);
+}
+.spine-mark span:nth-child(1){ height:60%; background:var(--accent-red); }
+.spine-mark span:nth-child(2){ height:100%; background:var(--accent-gold); }
+.spine-mark span:nth-child(3){ height:75%; background:var(--accent-green); }
+.spine-mark span:nth-child(4){ height:90%; background:var(--accent-gold-ink); }
+.spine-mark span:nth-child(5){ height:45%; background:var(--accent-red); }
+.spine-mark.loading span{ animation:spine-breathe 1.1s ease-in-out infinite; }
+.spine-mark.loading span:nth-child(1){ animation-delay:0s; }
+.spine-mark.loading span:nth-child(2){ animation-delay:.12s; }
+.spine-mark.loading span:nth-child(3){ animation-delay:.24s; }
+.spine-mark.loading span:nth-child(4){ animation-delay:.36s; }
+.spine-mark.loading span:nth-child(5){ animation-delay:.48s; }
+@keyframes spine-breathe{ 0%,100%{ transform:scaleY(1); } 50%{ transform:scaleY(0.4); } }
+
+
+/* ============================================================
+   HEADER / NAV
+============================================================= */
+header.app-header{
+  position:sticky; top:0; z-index:50;
+  background:var(--surface); border-bottom:1px solid var(--border);
+  display:flex; align-items:center; justify-content:space-between;
+  padding:14px 20px; gap:16px; flex-wrap:wrap;
+}
+.logo-wrap{ display:flex; align-items:center; gap:10px; cursor:pointer; background:none; border:none; padding:0; }
+.logo-wordmark{ font-family:var(--font-display); font-weight:600; font-size:1.3rem; color:var(--text); }
+.logo-wordmark em{ font-style:normal; color:var(--accent-gold-ink); }
+
+
+nav.main-nav{ display:flex; align-items:center; gap:4px; flex-wrap:wrap; }
+@media (max-width:640px){
+  header.app-header{ padding:12px 16px; }
+  nav.main-nav{
+    flex-wrap:nowrap; overflow-x:auto; -webkit-overflow-scrolling:touch;
+    width:100%; order:3; /* drop nav to its own full-width scrollable row */
+    padding-bottom:2px; scrollbar-width:none;
+  }
+  nav.main-nav::-webkit-scrollbar{ display:none; }
+  .nav-link{ flex:0 0 auto; }
+  .header-actions{ margin-left:auto; }
+}
+.nav-link{
+  background:none; border:none; padding:8px 12px; border-radius:8px;
+  font-size:.92rem; font-weight:600; color:var(--text-muted);
+  min-height:44px; white-space:nowrap; /* 44px = comfortable touch target */
+}
+.nav-link:hover{ color:var(--text); background:var(--surface-2); }
+.nav-link.active{ color:var(--text); background:var(--surface-2); }
+.nav-link[hidden]{ display:none; }
+
+
+.header-actions{ display:flex; align-items:center; gap:10px; }
+.theme-toggle{
+  /* invisible 44x44 tap zone wrapping a visually-smaller pill track */
+  width:44px; height:44px; border:none; background:none; position:relative; padding:0; flex:0 0 auto;
+}
+.theme-toggle::before{
+  content:''; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+  width:40px; height:24px; border-radius:20px; background:var(--surface-2); border:1px solid var(--border);
+}
+.theme-toggle::after{
+  content:''; position:absolute; top:50%; left:calc(50% - 18px); width:18px; height:18px; margin-top:-9px;
+  border-radius:50%; background:var(--accent-gold); transition:transform .2s ease;
+}
+:root[data-theme="dark"] .theme-toggle::after{ transform:translateX(18px); }
+
+
+.btn{
+  border-radius:8px; border:1px solid var(--border); background:var(--surface-2);
+  color:var(--text); padding:9px 16px; font-weight:600; font-size:.9rem;
+  min-height:44px; /* comfortable touch target */
+}
+.btn:hover{ border-color:var(--accent-gold); }
+.btn-primary{ background:var(--accent-gold); border-color:var(--accent-gold); color:#241B08; }
+.btn-primary:hover{ background:var(--accent-gold-ink); }
+.btn-outline{ background:transparent; }
+.btn-block{ width:100%; }
+.btn:disabled{ opacity:.55; cursor:not-allowed; }
+
+
+.user-chip{ display:flex; align-items:center; gap:8px; font-size:.85rem; color:var(--text-muted); }
+.user-chip img{ width:28px; height:28px; border-radius:50%; }
+
+
+.auth-error-banner{
+  display:flex; align-items:center; justify-content:space-between; gap:12px;
+  background:var(--accent-red); color:#FFF6F2; font-size:.85rem; font-weight:500;
+  padding:10px 20px;
+}
+.auth-error-banner[hidden]{ display:none; }
+.auth-error-dismiss{
+  background:none; border:none; color:inherit; font-size:1rem; line-height:1; padding:4px 8px;
+  min-height:32px; opacity:.85;
+}
+.auth-error-dismiss:hover{ opacity:1; }
+
+
+/* ============================================================
+   LAYOUT / PAGE SYSTEM
+============================================================= */
+main{ max-width:1180px; margin:0 auto; padding:28px 20px 80px; }
+.page{ display:none; }
+.page.active{ display:block; animation:page-in .3s ease; }
+@keyframes page-in{ from{ opacity:0; transform:translateY(6px); } to{ opacity:1; transform:translateY(0); } }
+
+
+.section-eyebrow{
+  font-family:var(--font-mono); font-size:.72rem; letter-spacing:.14em; text-transform:uppercase;
+  color:var(--accent-gold-ink); margin-bottom:6px; display:block;
+}
+.page-hero{ margin-bottom:28px; }
+.page-hero p{ color:var(--text-muted); max-width:60ch; }
+
+
+.shelf-ledge{
+  height:1px; background:var(--border); position:relative; margin:6px 0 26px;
+}
+.shelf-ledge::after{
+  content:''; position:absolute; left:0; right:0; top:1px; height:6px;
+  background:linear-gradient(var(--shadow), transparent);
+}
+
+
+/* ============================================================
+   CATALOG
+============================================================= */
+.catalog-controls{
+  display:flex; flex-wrap:wrap; gap:10px; margin-bottom:22px;
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px;
+}
+.catalog-controls input, .catalog-controls select{
+  /* font-size 16px avoids iOS Safari's auto-zoom-on-focus for form fields */
+  font-family:var(--font-body); font-size:16px; padding:9px 12px; border-radius:8px;
+  border:1px solid var(--border); background:var(--bg); color:var(--text);
+}
+.catalog-controls input[type="search"]{ flex:1 1 220px; }
+@media (max-width:480px){
+  .catalog-controls{ flex-direction:column; align-items:stretch; }
+  .catalog-controls input, .catalog-controls select{ width:100%; }
+}
+
+
+.book-grid{
+  display:grid; grid-template-columns:repeat(auto-fill, minmax(180px,1fr)); gap:20px;
+}
+.book-card{
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  overflow:hidden; text-align:left; padding:0; display:flex; flex-direction:column;
+  transition:transform .18s ease, box-shadow .18s ease;
+}
+.book-card:hover{ transform:translateY(-3px); box-shadow:0 10px 24px var(--shadow); border-color:var(--accent-gold); }
+.book-cover{ height:150px; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+.book-cover img{ width:100%; height:100%; object-fit:cover; }
+.book-cover .spine-mark span{ height:70%; }
+.book-cover .spine-mark span:nth-child(2){ height:100%; }
+.book-card-body{ padding:14px; display:flex; flex-direction:column; gap:4px; flex:1; }
+.book-card-title{ font-family:var(--font-display); font-weight:600; font-size:1.02rem; line-height:1.25; overflow-wrap:break-word; }
+.book-card-author{ font-size:.82rem; color:var(--text-muted); }
+.book-card-meta{ display:flex; justify-content:space-between; align-items:center; margin-top:auto; padding-top:8px; }
+.book-price{ font-family:var(--font-mono); font-weight:600; }
+.book-rating{ font-size:.8rem; color:var(--accent-gold-ink); }
+.empty-state{ text-align:center; padding:60px 20px; color:var(--text-muted); }
+
+
+/* ============================================================
+   BOOK DETAILS
+============================================================= */
+.details-layout{ display:grid; grid-template-columns:260px 1fr; gap:32px; }
+@media (max-width:720px){ .details-layout{ grid-template-columns:1fr; } }
+.details-cover{ height:340px; border-radius:var(--radius); display:flex; align-items:center; justify-content:center; border:1px solid var(--border); overflow:hidden; }
+.details-cover img{ width:100%; height:100%; object-fit:cover; }
+.details-cover .spine-mark{ height:64px; }
+.details-cover .spine-mark span{ width:10px; }
+.details-genre-tag{
+  display:inline-block; font-family:var(--font-mono); font-size:.72rem; text-transform:uppercase;
+  letter-spacing:.08em; color:var(--accent-green); background:var(--surface-2); border-radius:6px; padding:3px 8px; margin-bottom:10px;
+}
+.details-price-row{ display:flex; align-items:baseline; gap:10px; margin:12px 0 20px; }
+.details-price{ font-family:var(--font-mono); font-size:1.6rem; font-weight:600; }
+.checkout-actions{ display:flex; gap:12px; flex-wrap:wrap; margin-bottom:28px; }
+.checkout-actions .btn{ flex:1 1 200px; }
+
+
+.review{ border-bottom:1px solid var(--border); padding:14px 0; }
+.review:last-child{ border-bottom:none; }
+.review-head{ display:flex; justify-content:space-between; font-size:.85rem; color:var(--text-muted); margin-bottom:4px; }
+.review-stars{ color:var(--accent-gold-ink); }
+.review-form textarea{
+  width:100%; min-height:80px; font-family:var(--font-body); font-size:16px; padding:10px; border-radius:8px;
+  border:1px solid var(--border); background:var(--surface); color:var(--text); resize:vertical;
+}
+
+
+/* ============================================================
+   READER
+============================================================= */
+.reader-frame{
+  background:#0000; border:1px solid var(--border); border-radius:var(--radius);
+  min-height:60vh; display:flex; flex-direction:column; overflow:hidden;
+}
+.reader-toolbar{
+  display:flex; align-items:center; justify-content:space-between; padding:10px 16px;
+  background:var(--surface); border-bottom:1px solid var(--border); flex-wrap:wrap; gap:8px;
+}
+.reader-brand{ font-family:var(--font-display); font-weight:600; font-size:.95rem; display:flex; align-items:center; gap:8px; }
+.reader-canvas-wrap{
+  flex:1; background:var(--surface-2); padding:24px; overflow:auto;
+  user-select:none; -webkit-user-select:none; -moz-user-select:none;
+}
+@media (max-width:600px){ .reader-canvas-wrap{ padding:12px; } }
+.reader-canvas-wrap, .reader-canvas-wrap *{ user-select:none !important; -webkit-user-select:none !important; }
+#pdf-pages canvas{ display:block; margin:0 auto 16px; box-shadow:0 4px 14px var(--shadow); max-width:100%; height:auto; }
+#epub-viewer{ height:65vh; background:var(--surface); border-radius:8px; }
+.reader-watermark-note{ font-size:.75rem; color:var(--text-muted); padding:8px 16px; }
+
+
+/* ============================================================
+   ORDERS
+============================================================= */
+.order-row{
+  display:flex; align-items:center; gap:16px; padding:14px; border:1px solid var(--border);
+  border-radius:var(--radius); background:var(--surface); margin-bottom:12px; flex-wrap:wrap;
+}
+@media (max-width:560px){
+  .order-row{ align-items:flex-start; }
+  .order-row .status-badge{ order:1; }
+  .order-row .tracking-link, .order-row .btn{ flex:1 1 100%; order:2; margin-top:4px; }
+}
+.order-row .book-cover.mini{ width:52px; height:70px; flex:0 0 auto; border-radius:6px; }
+.order-info{ flex:1 1 220px; }
+.order-info .mono{ font-size:.78rem; color:var(--text-muted); }
+.status-badge{
+  font-family:var(--font-mono); font-size:.72rem; text-transform:uppercase; letter-spacing:.06em;
+  padding:4px 10px; border-radius:20px; font-weight:600;
+}
+.status-processing{ background:#F3D9A6; color:#5C4008; }
+.status-shipped{ background:#C9DCF0; color:#1D3F63; }
+.status-delivered{ background:#CFE3D3; color:var(--accent-green); }
+:root[data-theme="dark"] .status-processing{ background:#4A3A17; color:#F0CB78; }
+:root[data-theme="dark"] .status-shipped{ background:#233348; color:#9FC2ED; }
+:root[data-theme="dark"] .status-delivered{ background:#22392A; color:#8FCB9F; }
+.tracking-link{ font-size:.8rem; text-decoration:underline; color:var(--accent-gold-ink); }
+
+
+/* ============================================================
+   AUTHOR HUB
+============================================================= */
+.hub-tabs{ display:flex; gap:8px; margin-bottom:24px; border-bottom:1px solid var(--border); overflow-x:auto; -webkit-overflow-scrolling:touch; }
+.hub-tab{ background:none; border:none; padding:10px 4px; font-weight:600; color:var(--text-muted); border-bottom:2px solid transparent; margin-right:18px; }
+.hub-tab.active{ color:var(--text); border-color:var(--accent-gold); }
+
+
+.metric-grid{ display:grid; grid-template-columns:repeat(auto-fit, minmax(180px,1fr)); gap:16px; margin-bottom:30px; }
+.metric-card{ background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:18px; }
+.metric-label{ font-size:.78rem; color:var(--text-muted); text-transform:uppercase; letter-spacing:.06em; margin-bottom:6px; }
+.metric-value{ font-family:var(--font-mono); font-size:1.5rem; font-weight:600; }
+.metric-sub{ font-size:.78rem; color:var(--text-muted); margin-top:4px; }
+
+
+.book-manage-row{
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  padding:16px; margin-bottom:14px;
+}
+.book-manage-summary{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.book-manage-thumb{ width:44px; height:58px; border-radius:6px; overflow:hidden; flex:0 0 auto; background:var(--surface-2); display:flex; align-items:center; justify-content:center; }
+.book-manage-thumb img{ width:100%; height:100%; object-fit:cover; }
+.book-manage-thumb .spine-mark{ height:32px; }
+.book-manage-thumb .spine-mark span{ width:3px; }
+.book-manage-summary .title{ font-family:var(--font-display); font-weight:600; flex:1 1 160px; }
+.book-manage-summary .mono{ color:var(--text-muted); }
+.book-status-badge{
+  font-family:var(--font-mono); font-size:.72rem; text-transform:uppercase; letter-spacing:.06em;
+  padding:3px 9px; border-radius:20px; font-weight:600;
+}
+.book-status-published{ background:#CFE3D3; color:var(--accent-green); }
+.book-status-archived{ background:var(--surface-2); color:var(--text-muted); }
+:root[data-theme="dark"] .book-status-published{ background:#22392A; color:#8FCB9F; }
+.book-edit-form{ margin-top:16px; padding-top:16px; border-top:1px solid var(--border); display:none; }
+.book-edit-form.open{ display:block; }
+.book-edit-actions{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }
+.checkbox-field{ display:flex; align-items:center; gap:8px; font-size:.88rem; }
+.checkbox-field input{ width:auto; }
+
+
+.form-grid{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+@media (max-width:600px){ .form-grid{ grid-template-columns:1fr; } }
+.field label{ display:block; font-size:.82rem; font-weight:600; margin-bottom:6px; }
+.field input, .field select, .field textarea{
+  width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--border);
+  background:var(--surface); color:var(--text); font-family:var(--font-body); font-size:16px;
+}
+.upload-slot{
+  border:1.5px dashed var(--border); border-radius:var(--radius); padding:16px; text-align:center;
+  background:var(--surface); font-size:.85rem; color:var(--text-muted); cursor:pointer;
+}
+.upload-slot.filled{ border-color:var(--accent-green); color:var(--accent-green); }
+.upload-slot input{ display:none; }
+.upload-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:14px; margin:20px 0; }
+
+
+.progress-track{ height:8px; border-radius:6px; background:var(--surface-2); overflow:hidden; margin-top:16px; display:none; }
+.progress-track.active{ display:block; }
+.progress-fill{ height:100%; width:0%; background:var(--accent-gold); transition:width .2s ease; }
+.form-note{ font-size:.8rem; color:var(--text-muted); margin-top:14px; }
+
+
+.gate-notice{
+  background:var(--surface); border:1px dashed var(--border); border-radius:var(--radius);
+  padding:40px; text-align:center; color:var(--text-muted);
+}
+</style>
+</head>
+<body>
+
+
+<!-- ================= HEADER ================= -->
+<header class="app-header">
+  <button class="logo-wrap" onclick="StoryStack.navigateTo('catalog')" aria-label="Story Stack home">
+    <span class="spine-mark"><span></span><span></span><span></span><span></span><span></span></span>
+    <span class="logo-wordmark">Story <em>Stack</em></span>
+  </button>
+
+
+  <nav class="main-nav">
+    <button class="nav-link" data-page="catalog" onclick="StoryStack.navigateTo('catalog')">Catalog</button>
+    <button class="nav-link" data-page="orders" onclick="StoryStack.navigateTo('orders')">My Orders</button>
+    <button class="nav-link" data-page="author" hidden onclick="StoryStack.navigateTo('author')">Author Hub</button>
+  </nav>
+
+
+  <div class="header-actions">
+    <button class="theme-toggle" id="themeToggle" aria-label="Toggle dark mode" onclick="StoryStack.toggleTheme()"></button>
+    <div id="authArea"></div>
+  </div>
+</header>
+
+
+<!-- Surfaces sign-in / auth failures that used to fail silently. Hidden by default. -->
+<div id="authErrorBanner" class="auth-error-banner" hidden>
+  <span id="authErrorText"></span>
+  <button class="auth-error-dismiss" onclick="StoryStack.hideAuthError()" aria-label="Dismiss">✕</button>
+</div>
+
+
+<main>
+
+
+  <!-- ================= PAGE 1 — CATALOG ================= -->
+  <section class="page" id="page-catalog" data-page="catalog">
+    <div class="page-hero">
+      <span class="section-eyebrow">The Story Stack Master Catalog</span>
+      <h1>Welcome to Story Stack</h1>
+      <p>Independent authors, printed on demand or read instantly — every title on the shelf is sold direct, with royalties routed straight to the person who wrote it.</p>
+    </div>
+
+
+    <div class="catalog-controls">
+      <input type="search" id="catalogSearch" placeholder="Search titles or authors…" oninput="StoryStack.renderCatalog()" />
+      <select id="catalogGenre" onchange="StoryStack.renderCatalog()">
+        <option value="">All genres</option>
+      </select>
+      <select id="catalogSort" onchange="StoryStack.renderCatalog()">
+        <option value="relevance">Sort: Relevance</option>
+        <option value="price-asc">Price: Low to High</option>
+        <option value="rating-desc">Top Rated</option>
+      </select>
+    </div>
+
+
+    <div class="shelf-ledge"></div>
+    <div class="book-grid" id="catalogGrid"></div>
+  </section>
+
+
+  <!-- ================= PAGE 2 — DETAILS ================= -->
+  <section class="page" id="page-details" data-page="details">
+    <div id="detailsContent"><!-- rendered by StoryStack.renderDetails --></div>
+  </section>
+
+
+  <!-- ================= PAGE 3 — READER ================= -->
+  <section class="page" id="page-reader" data-page="reader">
+    <div class="page-hero">
+      <span class="section-eyebrow">Now Reading</span>
+      <h1 id="readerBookTitle">Story Stack eReader</h1>
+    </div>
+    <div class="reader-frame">
+      <div class="reader-toolbar">
+        <span class="reader-brand"><span class="spine-mark" id="readerSpinner"><span></span><span></span><span></span><span></span><span></span></span> Story Stack eReader</span>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button class="btn btn-outline" id="readerBookmarkBtn" onclick="StoryStack.bookmarkCurrentPosition()" style="display:none;">🔖 Bookmark this spot</button>
+          <button class="btn btn-outline" onclick="StoryStack.navigateTo('catalog')">Close</button>
+        </div>
+      </div>
+      <div class="reader-canvas-wrap" id="readerCanvasWrap" oncontextmenu="return false;">
+        <div id="epub-viewer" style="display:none;"></div>
+        <div id="pdf-pages"></div>
+        <div id="readerStatus" style="text-align:center;padding-top:16vh;">
+          <span class="spine-mark loading" style="height:36px;"><span></span><span></span><span></span><span></span><span></span></span>
+          <p id="readerStatusText" style="color:var(--text-muted);margin-top:14px;">Loading book…</p>
+        </div>
+      </div>
+      <p class="reader-watermark-note">This copy is licensed to your Story Stack account. Copying and printing are disabled to protect the author's work.</p>
+    </div>
+  </section>
+
+
+  <!-- ================= PAGE 4 — ORDERS ================= -->
+  <section class="page" id="page-orders" data-page="orders">
+    <div class="page-hero">
+      <span class="section-eyebrow">Customer Order Tracker</span>
+      <h1>My Orders</h1>
+      <p>Every print and digital purchase you've made on Story Stack, with live fulfillment status.</p>
+    </div>
+    <div class="shelf-ledge"></div>
+    <div id="ordersList"></div>
+  </section>
+
+
+  <!-- ================= PAGE 5 — AUTHOR HUB ================= -->
+  <section class="page" id="page-author" data-page="author">
+    <div class="page-hero">
+      <span class="section-eyebrow">Story Stack Author Hub</span>
+      <h1>Author Hub</h1>
+      <p>Track your sales and publish new work directly to the catalog.</p>
+    </div>
+
+
+    <!-- Shown to signed-in users who aren't a registered author yet -->
+    <div id="authorRegisterGate" style="display:none;max-width:480px;">
+      <p style="color:var(--text-muted);">Register as a Story Stack author to publish books and see your sales.</p>
+      <form onsubmit="return StoryStack.submitAuthorRegistration(event)">
+        <div class="field" style="margin-bottom:14px;">
+          <label for="regDisplayName">Author name</label>
+          <input type="text" id="regDisplayName" required />
+        </div>
+        <div class="field" style="margin-bottom:16px;">
+          <label for="regBio">Short bio (optional)</label>
+          <textarea id="regBio" rows="3"></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary" id="registerAuthorBtn">Become an Author</button>
+        <p class="form-note" id="registerAuthorNote"></p>
+      </form>
+
+      <!-- TEMPORARY DEBUG TOOL — lets you check your real author status
+           without devtools, straight from the page. Safe to remove once
+           things are confirmed working end to end. -->
+      <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);">
+        <button type="button" class="btn btn-outline" onclick="StoryStack.checkAuthorStatus()">Check my status</button>
+        <pre id="authorStatusDebug" style="display:none;white-space:pre-wrap;font-size:.78rem;background:var(--surface-2);padding:10px;border-radius:8px;margin-top:10px;"></pre>
+      </div>
+    </div>
+
+
+    <div id="authorHubMain">
+      <div class="hub-tabs">
+        <button class="hub-tab active" id="tab-dashboard" onclick="StoryStack.setAuthorView('dashboard')">Sales Analytics</button>
+        <button class="hub-tab" id="tab-mybooks" onclick="StoryStack.setAuthorView('mybooks')">My Books</button>
+        <button class="hub-tab" id="tab-publish" onclick="StoryStack.setAuthorView('publish')">Publishing Wizard</button>
+      </div>
+
+
+    <!-- View A: dashboard -->
+    <div id="authorView-dashboard">
+      <div id="stripeConnectPrompt" style="margin-bottom:20px;padding:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);">
+        <p id="stripeConnectStatusText" style="margin:0 0 10px;color:var(--text-muted);">Checking your Stripe status…</p>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+          <button class="btn btn-primary" onclick="StoryStack.connectStripe()" id="connectStripeBtn">Connect Payouts with Stripe</button>
+          <button class="btn btn-outline" onclick="StoryStack.refreshStripeConnectStatus()">Refresh status</button>
+        </div>
+        <p class="form-note" id="connectStripeNote"></p>
+      </div>
+      <div class="metric-grid" id="authorMetrics"></div>
+    </div>
+
+
+    <!-- View B: my books (list + inline edit) -->
+    <div id="authorView-mybooks" style="display:none;">
+      <div id="myBooksList"></div>
+    </div>
+
+
+    <!-- View C: publishing wizard -->
+    <div id="authorView-publish" style="display:none;">
+      <form id="publishForm" onsubmit="return StoryStack.submitPublishForm(event)">
+        <div class="form-grid">
+          <div class="field">
+            <label for="pubTitle">Title</label>
+            <input type="text" id="pubTitle" required />
+          </div>
+          <div class="field">
+            <label for="pubGenre">Genre</label>
+            <select id="pubGenre">
+              <option>Fiction</option><option>Non-Fiction</option><option>Poetry</option>
+              <option>Sci-Fi &amp; Fantasy</option><option>Mystery</option><option>Children's</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="pubEbookPrice">Ebook Price (USD) <span style="font-weight:400;color:var(--text-muted);">(only needed for digital)</span></label>
+            <input type="number" id="pubEbookPrice" min="0" step="0.01" />
+          </div>
+        </div>
+
+        <div style="margin-top:16px;padding:14px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);">
+          <p style="margin:0 0 10px;font-weight:600;font-size:.85rem;">Print pricing <span style="font-weight:400;color:var(--text-muted);">(only needed if uploading print files)</span></p>
+          <div class="form-grid">
+            <div class="field">
+              <label for="pubLuluPackageId">Lulu Print Package ID</label>
+              <input type="text" id="pubLuluPackageId" placeholder="e.g. 0600X0900BWSTD..." />
+            </div>
+            <div class="field">
+              <label for="pubPageCount">Page Count</label>
+              <input type="number" id="pubPageCount" min="1" step="1" />
+            </div>
+          </div>
+          <button type="button" class="btn btn-outline" style="margin-top:10px;" onclick="StoryStack.calculatePrintCost('pub')">Calculate Print Cost</button>
+          <p class="form-note" id="pubPrintCostNote"></p>
+          <div class="field" style="margin-top:10px;max-width:220px;">
+            <label for="pubPrintPrice">Print Price (USD)</label>
+            <input type="number" id="pubPrintPrice" min="0" step="0.01" />
+          </div>
+        </div>
+
+
+        <div class="upload-grid">
+          <label class="upload-slot" id="slot-ebookCover">
+            <input type="file" accept="image/*" onchange="StoryStack.handleFileSlot(this,'slot-ebookCover')" />
+            Ebook Cover Image
+          </label>
+          <label class="upload-slot" id="slot-printCover">
+            <input type="file" accept="application/pdf" onchange="StoryStack.handleFileSlot(this,'slot-printCover')" />
+            Print Cover PDF
+          </label>
+          <label class="upload-slot" id="slot-epub">
+            <input type="file" accept=".epub,application/epub+zip" onchange="StoryStack.handleFileSlot(this,'slot-epub')" />
+            EPUB Manuscript
+          </label>
+          <label class="upload-slot" id="slot-printInterior">
+            <input type="file" accept="application/pdf" onchange="StoryStack.handleFileSlot(this,'slot-printInterior')" />
+            Print Interior PDF
+          </label>
+        </div>
+
+
+        <div class="progress-track" id="uploadProgressTrack"><div class="progress-fill" id="uploadProgressFill"></div></div>
+        <button type="submit" class="btn btn-primary" id="publishSubmitBtn">Publish to Story Stack</button>
+        <p class="form-note" id="publishNote"></p>
+      </form>
+    </div>
+    </div><!-- /#authorHubMain -->
+  </section>
+
+
+</main>
+
+
+<script>
+/* ================================================================
+   STORY STACK — SPA CORE
+   Everything below is namespaced under window.StoryStack so this
+   embed never leaks globals into the surrounding Google Sites page.
+================================================================= */
+(function(){
+
+
+  // ---- CONFIG: point this at your deployed backend (see server.js /
+  // routes built for Story Stack's API) ----
+  const API_BASE_URL = 'https://story-stack-102d.onrender.com';
+  // Exposed so the Firebase module script (in <head>) can build the same
+  // /api/author/register request without duplicating this constant.
+  window.STORY_STACK_API_BASE_URL = API_BASE_URL;
+
+
+  const state = {
+    currentPage: 'catalog',
+    pageData: {},
+    user: null,          // { uid, name, email, photoURL, idToken, isAuthor }
+    theme: 'light',
+    books: [],
+    orders: [],
+    ownedDigitalBookIds: new Set(), // bookIds this user has actually paid for — gates the reader
+    authorView: 'dashboard'
+  };
+
+
+  // ---------------------------------------------------------------
+  // MOCK DATA — used as a graceful fallback whenever the live API
+  // isn't reachable (e.g. previewing this embed before the backend
+  // is deployed). Replace by wiring fetchBooks/fetchOrders fully.
+  // ---------------------------------------------------------------
+  const MOCK_BOOKS = [
+    { id:'1', title:'The Cartographer\'s Debt', author:'Wren Osei', genre:'Sci-Fi & Fantasy', ebookPriceCents:1499, printPriceCents:1899, rating:4.8, description:'A mapmaker inherits a debt owed in stolen coastlines, and has one tide to repay it.', digital:true, print:true },
+    { id:'2', title:'Salt & Static', author:'Marguerite Volk', genre:'Fiction', ebookPriceCents:1199, printPriceCents:1599, rating:4.5, description:'Three sisters run a failing radio station on a coast that keeps eroding under them.', digital:true, print:true },
+    { id:'3', title:'A Ledger of Small Gods', author:'Priya Nadkarni', genre:'Poetry', ebookPriceCents:899, printPriceCents:null, rating:4.9, description:'Short devotional poems for the minor, unnamed gods of ordinary rooms.', digital:true, print:false },
+    { id:'4', title:'The Quiet Applicant', author:'Dov Achterberg', genre:'Mystery', ebookPriceCents:1399, printPriceCents:1799, rating:4.3, description:'A hiring manager notices the same résumé, under different names, for a decade.', digital:true, print:true },
+    { id:'5', title:'Everything Eats Light', author:'Nia Fontaine', genre:'Non-Fiction', ebookPriceCents:1699, printPriceCents:2199, rating:4.6, description:'A field biologist\'s account of bioluminescence, from deep sea vents to fireflies.', digital:true, print:true },
+    { id:'6', title:'Bramblewick\'s Second Winter', author:'Owen Castellane', genre:'Children\'s', ebookPriceCents:999, printPriceCents:1399, rating:4.7, description:'A hedgehog who was sure he\'d packed enough acorns learns he hadn\'t.', digital:true, print:true }
+  ];
+  const MOCK_REVIEWS = {
+    '1':[{name:'Ines T.', stars:5, text:'The prose is so precise it almost hurts. Read it in one sitting.'}, {name:'Marcus L.', stars:4, text:'Slow start, but the last third earns every page before it.'}],
+    '2':[{name:'Farah D.', stars:5, text:'Every sister felt fully real to me — no easy villain among them.'}]
+  };
+  const MOCK_ORDERS = [
+    { id:'ord_8842', bookId:'1', bookTitle:'The Cartographer\'s Debt', type:'print', status:'shipped', carrier:'UPS', tracking:'1Z999AA10123456784', date:'2026-07-28' },
+    { id:'ord_8811', bookId:'3', bookTitle:'A Ledger of Small Gods', type:'digital', status:'delivered', date:'2026-07-14' },
+    { id:'ord_8790', bookId:'5', bookTitle:'Everything Eats Light', type:'print', status:'processing', date:'2026-08-05' }
+  ];
+  const MOCK_AUTHOR_STATS = { lifetimeEarningsCents:284600, outstandingRoyaltiesCents:41200, printCopiesSold:212, digitalCopiesSold:389 };
+
+
+  // ---------------------------------------------------------------
+  // API HELPER — attaches the Firebase ID token, falls back to mock
+  // data on any network/API failure so the page never dead-ends.
+  // ---------------------------------------------------------------
+  async function apiFetch(path, options = {}) {
+    const headers = Object.assign({}, options.headers || {});
+    if (state.user && state.user.idToken) {
+      headers['Authorization'] = `Bearer ${state.user.idToken}`;
+    }
+    const res = await fetch(`${API_BASE_URL}${path}`, { ...options, headers });
+    if (!res.ok) {
+      // Previously this discarded the backend's actual error message and
+      // only kept the HTTP status code — every failure banner ended up
+      // generic ("responded 409") instead of showing the specific,
+      // actionable reason the backend controllers already provide.
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `API ${path} responded ${res.status}`);
+    }
+    return res.json();
+  }
+
+
+  async function loadBooks() {
+    try { state.books = await apiFetch('/api/books'); }
+    catch (e) { console.warn('[catalog] Falling back to demo catalog:', e.message); state.books = MOCK_BOOKS; }
+    populateGenreOptions();
+    renderCatalog();
+  }
+
+
+  async function loadOrders() {
+    if (!state.user) { state.orders = []; renderOrders(); return; }
+    try { state.orders = await apiFetch('/api/orders'); }
+    catch (e) { console.warn('[orders] Falling back to demo orders:', e.message); state.orders = MOCK_ORDERS; }
+    renderOrders();
+  }
+
+
+  // Source of truth for "does this signed-in user actually own this ebook".
+  // Both the details page (Buy vs Read Now) and the reader page (hard gate)
+  // read from this — never inferred client-side from anything but a paid order.
+  async function loadOwnedDigital() {
+    if (!state.user) { state.ownedDigitalBookIds = new Set(); return; }
+    try {
+      // Expected shape: { bookIds: ['id1','id2', ...] } — every digital
+      // purchase with status = 'paid' for the current Firebase UID.
+      const data = await apiFetch('/api/purchases/digital');
+      state.ownedDigitalBookIds = new Set(data.bookIds || []);
+    } catch (e) {
+      console.warn('[ownership] Falling back to demo purchase history:', e.message);
+      // Demo fallback: derive ownership from the mock orders list so the
+      // "must buy before reading" gate can still be exercised in preview.
+      const owned = MOCK_ORDERS
+        .filter(o => o.type === 'digital' && (o.status === 'paid' || o.status === 'delivered'))
+        .map(o => o.bookId)
+        .filter(Boolean);
+      state.ownedDigitalBookIds = new Set(owned);
+    }
+  }
+
+
+  // ---------------------------------------------------------------
+  // ROUTING
+  // ---------------------------------------------------------------
+  function navigateTo(pageName, data = {}) {
+    state.currentPage = pageName;
+    state.pageData = data;
+
+
+    document.querySelectorAll('.page').forEach(el => el.classList.remove('active'));
+    document.getElementById(`page-${pageName}`).classList.add('active');
+
+
+    document.querySelectorAll('.nav-link[data-page]').forEach(el => {
+      el.classList.toggle('active', el.dataset.page === pageName);
+    });
+
+
+    window.scrollTo({ top:0, behavior:'smooth' });
+
+
+    if (pageName === 'catalog') renderCatalog();
+    if (pageName === 'details') renderDetails(data.bookId);
+    if (pageName === 'reader') renderReader(data.bookId);
+    if (pageName === 'orders') loadOrders();
+    if (pageName === 'author') renderAuthorHub();
+  }
+
+
+  // ---------------------------------------------------------------
+  // THEME — defaults to system preference, then respects manual toggle.
+  // ---------------------------------------------------------------
+  function applyTheme(theme) {
+    state.theme = theme;
+    document.documentElement.setAttribute('data-theme', theme);
+  }
+  function toggleTheme() { applyTheme(state.theme === 'dark' ? 'light' : 'dark'); }
+  function initTheme() {
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    applyTheme(prefersDark ? 'dark' : 'light');
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+      applyTheme(e.matches ? 'dark' : 'light');
+    });
+  }
+
+
+  // ---------------------------------------------------------------
+  // AUTH UI — called by the Firebase onAuthStateChanged listener above.
+  // ---------------------------------------------------------------
+  function setUser(user) {
+    state.user = user;
+    renderAuthArea();
+
+
+    // Author Hub nav link is visible to any signed-in user — non-authors
+    // land on a "become an author" registration prompt when they open it
+    // (see renderAuthorHub), rather than the link being hidden entirely,
+    // which previously made becoming an author unreachable in the first
+    // place. Only hidden entirely when signed out.
+    document.querySelector('.nav-link[data-page="author"]').hidden = !user;
+
+
+    if (state.currentPage === 'author' && !user) navigateTo('catalog');
+    if (state.currentPage === 'author') renderAuthorHub();
+    if (state.currentPage === 'orders') loadOrders();
+
+
+    // Refresh what this user actually owns, then re-render any page whose
+    // content depends on it — otherwise a stale "Read Now" could survive
+    // a sign-out, or a stale "Buy" could survive a sign-in right after purchase.
+    loadOwnedDigital().then(() => {
+      if (state.currentPage === 'details') renderDetails(state.pageData.bookId);
+      if (state.currentPage === 'reader') renderReader(state.pageData.bookId);
+    });
+  }
+
+
+  function renderAuthArea() {
+    const el = document.getElementById('authArea');
+    if (!state.user) {
+      el.innerHTML = `<button class="btn btn-primary" onclick="window.StoryStackAuth.signIn()">Sign in</button>`;
+      return;
+    }
+    el.innerHTML = `
+      <div class="user-chip">
+        ${state.user.photoURL ? `<img src="${escapeHtml(state.user.photoURL)}" alt="" />` : ''}
+        <span>${escapeHtml(state.user.name)}</span>
+      </div>`;
+    const chip = el.querySelector('.user-chip');
+    chip.style.cursor = 'pointer';
+    chip.title = 'Sign out';
+    chip.onclick = () => window.StoryStackAuth.signOut();
+  }
+
+
+  // Surfaces sign-in/auth failures that would otherwise die silently in
+  // Generic on-page banner — replaces window.alert() everywhere in this
+  // app. Google Sites serves embedded "Embed code" HTML inside a
+  // sandboxed iframe, and that sandbox blocks window.alert()/confirm()/
+  // prompt() entirely and SILENTLY (no error — the call just does
+  // nothing) unless the sandbox explicitly allows modals, which Google
+  // Sites' embed sandbox does not. Every alert() in this file was
+  // therefore likely invisible in production — including "Sign in to
+  // purchase" — which is why clicking Buy could look like it did
+  // nothing at all. Use showBanner() for anything that used to be an
+  // alert().
+  function showBanner(message) {
+    const banner = document.getElementById('authErrorBanner');
+    document.getElementById('authErrorText').textContent = message;
+    banner.hidden = false;
+  }
+  function hideBanner() {
+    document.getElementById('authErrorBanner').hidden = true;
+  }
+  // Kept as aliases — the Firebase module script (<head>) already calls
+  // these exact names.
+  const showAuthError = showBanner;
+  const hideAuthError = hideBanner;
+
+
+  // ---------------------------------------------------------------
+  // PAGE 1 — CATALOG
+  // ---------------------------------------------------------------
+  function populateGenreOptions() {
+    const genres = [...new Set(state.books.map(b => b.genre))].sort();
+    const select = document.getElementById('catalogGenre');
+    select.innerHTML = `<option value="">All genres</option>` +
+      genres.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('');
+  }
+
+
+  function renderCatalog() {
+    const query = (document.getElementById('catalogSearch').value || '').toLowerCase();
+    const genre = document.getElementById('catalogGenre').value;
+    const sort = document.getElementById('catalogSort').value;
+
+
+    let list = state.books.filter(b =>
+      (!query || b.title.toLowerCase().includes(query) || b.author.toLowerCase().includes(query)) &&
+      (!genre || b.genre === genre)
+    );
+
+
+    if (sort === 'price-asc') list = list.slice().sort((a,b) => (a.ebookPriceCents ?? a.printPriceCents ?? 0) - (b.ebookPriceCents ?? b.printPriceCents ?? 0));
+    if (sort === 'rating-desc') list = list.slice().sort((a,b) => b.rating - a.rating);
+
+
+    const grid = document.getElementById('catalogGrid');
+    if (list.length === 0) {
+      grid.innerHTML = `<div class="empty-state">No titles match that search. Try a different genre or keyword.</div>`;
+      return;
+    }
+
+
+    grid.innerHTML = list.map(b => `
+      <button class="book-card" onclick="StoryStack.navigateTo('details', { bookId: '${b.id}' })">
+        <div class="book-cover" style="background:var(--surface-2);">
+          ${bookCoverHtml(b)}
+        </div>
+        <div class="book-card-body">
+          <div class="book-card-title">${escapeHtml(b.title)}</div>
+          <div class="book-card-author">${escapeHtml(b.author)}</div>
+          <div class="book-card-meta">
+            <span class="book-price">${formatBookPriceRange(b)}</span>
+            <span class="book-rating">★ ${b.rating.toFixed(1)}</span>
+          </div>
+        </div>
+      </button>
+    `).join('');
+  }
+
+
+  // ---------------------------------------------------------------
+  // PAGE 2 — DETAILS
+  // ---------------------------------------------------------------
+  function renderDetails(bookId) {
+    const book = state.books.find(b => b.id === bookId);
+    const el = document.getElementById('detailsContent');
+    if (!book) { el.innerHTML = `<div class="empty-state">That title isn't in the catalog.</div>`; return; }
+
+
+    el.innerHTML = `
+      <div class="details-layout">
+        <div>
+          <div class="details-cover" style="background:var(--surface-2);">
+            ${bookCoverHtml(book)}
+          </div>
+        </div>
+        <div>
+          <span class="details-genre-tag">${escapeHtml(book.genre)}</span>
+          <h1>${escapeHtml(book.title)}</h1>
+          <p style="color:var(--text-muted);">by ${escapeHtml(book.author)}</p>
+          <p>${escapeHtml(book.description)}</p>
+          <div class="details-price-row">
+            <span class="details-price">${formatBookPriceRange(book)}</span>
+            <span class="book-rating">★ ${book.rating.toFixed(1)} average</span>
+          </div>
+          <div class="checkout-actions">
+            ${book.print ? `<button class="btn btn-primary" onclick="StoryStack.startCheckout('${book.id}','print')">Buy Printed Edition — $${(book.printPriceCents/100).toFixed(2)}</button>` : ''}
+            ${book.digital ? (
+              state.ownedDigitalBookIds.has(book.id)
+                ? `<button class="btn btn-outline" onclick="StoryStack.navigateTo('reader', { bookId: '${book.id}' })">Read Now</button>`
+                : `<button class="btn btn-outline" onclick="StoryStack.startCheckout('${book.id}','digital')">Buy Digital Ebook — $${(book.ebookPriceCents/100).toFixed(2)}</button>`
+            ) : ''}
+          </div>
+
+
+          <h3>Reader Reviews</h3>
+          <div id="reviewsList"><p style="color:var(--text-muted);">Loading reviews…</p></div>
+
+
+          <form class="review-form" style="margin-top:16px;" onsubmit="return StoryStack.submitReview(event, '${book.id}')">
+            <label for="reviewText" style="display:block;font-weight:600;font-size:.85rem;margin-bottom:6px;">Leave a review (verified buyers only)</label>
+            <div class="field" style="max-width:160px;margin-bottom:10px;">
+              <label for="reviewStars" style="font-size:.8rem;">Rating</label>
+              <select id="reviewStars">
+                <option value="5">★★★★★ (5)</option>
+                <option value="4">★★★★☆ (4)</option>
+                <option value="3">★★★☆☆ (3)</option>
+                <option value="2">★★☆☆☆ (2)</option>
+                <option value="1">★☆☆☆☆ (1)</option>
+              </select>
+            </div>
+            <textarea id="reviewText" placeholder="What did you think?"></textarea>
+            <button type="submit" class="btn" style="margin-top:8px;">Submit Review</button>
+            <p class="form-note" id="reviewNote"></p>
+          </form>
+        </div>
+      </div>
+    `;
+
+    loadReviewsFor(bookId);
+  }
+
+  // Fetches real reviews and fills in #reviewsList once loaded, separately
+  // from the main render above — that way the price/buy buttons don't sit
+  // waiting on a reviews round-trip. Guards against a slow response
+  // landing after the person has already navigated to a different book.
+  async function loadReviewsFor(bookId) {
+    const listEl = document.getElementById('reviewsList');
+    let reviews = [];
+    try {
+      reviews = await apiFetch(`/api/books/${bookId}/reviews`);
+    } catch (e) {
+      if (e instanceof TypeError) {
+        console.warn('[reviews] Could not reach the API, showing demo reviews:', e.message);
+        reviews = MOCK_REVIEWS[bookId] || [];
+      } else {
+        console.warn('[reviews] Failed to load reviews:', e.message);
+        reviews = [];
+      }
+    }
+
+    // Bail if the person has since navigated away from this book.
+    if (state.currentPage !== 'details' || state.pageData.bookId !== bookId) return;
+    if (!document.getElementById('reviewsList')) return;
+
+    listEl.innerHTML = reviews.length === 0
+      ? `<p style="color:var(--text-muted);">No reviews yet — be the first verified buyer to leave one.</p>`
+      : reviews.map(r => `
+        <div class="review">
+          <div class="review-head"><span>${escapeHtml(r.name)}</span><span class="review-stars">${'★'.repeat(r.stars)}${'☆'.repeat(5-r.stars)}</span></div>
+          <p>${escapeHtml(r.text)}</p>
+        </div>`).join('');
+  }
+
+
+  async function submitReview(evt, bookId) {
+    evt.preventDefault();
+    const text = document.getElementById('reviewText').value.trim();
+    const stars = document.getElementById('reviewStars').value;
+    const note = document.getElementById('reviewNote');
+    if (!text) return false;
+    if (!state.user) { showBanner('Sign in to leave a review.'); return false; }
+
+    note.textContent = 'Submitting…';
+    try {
+      await apiFetch(`/api/books/${bookId}/reviews`, {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({ stars, text })
+      });
+      note.textContent = '';
+      document.getElementById('reviewText').value = '';
+      loadReviewsFor(bookId); // re-fetch so the list reflects what was actually saved
+    } catch (e) {
+      // No more fake local success on failure — a rejected review (e.g.
+      // "only verified buyers can review this book") needs to actually
+      // say so, not silently appear to work and vanish on next refresh.
+      note.textContent = e.message || 'Could not submit your review.';
+    }
+    return false;
+  }
+
+
+  // Calls the backend's Stripe Checkout Session endpoint (Destination
+  // Charges — see POST /api/checkout/create-session) and hands off to
+  // Stripe-hosted checkout in a real new tab.
+  //
+  // IMPORTANT: this must be window.open(), not window.location.href.
+  // Google Sites embeds this page inside an iframe, and Stripe Checkout
+  // pages refuse to render inside any iframe at all (same framing
+  // restriction as Stripe Connect onboarding) — navigating the iframe's
+  // own location to a Stripe URL fails there instead of loading it.
+  async function startCheckout(bookId, purchaseType) {
+    if (!state.user) { showBanner('Sign in to purchase.'); return; }
+    try {
+      const { checkoutUrl } = await apiFetch('/api/checkout/create-session', {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({ bookId, purchaseType })
+      });
+
+      const popup = window.open(checkoutUrl, '_blank', 'noopener,noreferrer');
+      if (!popup) {
+        showBanner('Your browser blocked the checkout popup — tap the button again, or check your popup blocker settings.');
+      }
+    } catch (e) {
+      console.error('[checkout] failed:', e);
+      showBanner(e.message || 'Checkout is unavailable right now — please try again shortly.');
+    }
+  }
+
+
+  // ---------------------------------------------------------------
+  // PAGE 3 — READER (anti-copy)
+  // ---------------------------------------------------------------
+  let readerCopyGuardsBound = false;
+  function bindReaderCopyGuards() {
+    if (readerCopyGuardsBound) return;
+    readerCopyGuardsBound = true;
+
+
+    document.addEventListener('contextmenu', (e) => {
+      if (state.currentPage === 'reader') e.preventDefault();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (state.currentPage !== 'reader') return;
+      const key = e.key.toLowerCase();
+      const isCopyCombo = (e.ctrlKey || e.metaKey) && ['c','x','s','p'].includes(key);
+      if (isCopyCombo) e.preventDefault();
+    });
+    document.addEventListener('copy', (e) => {
+      if (state.currentPage === 'reader') e.preventDefault();
+    });
+  }
+
+
+  async function renderReader(bookId) {
+    bindReaderCopyGuards();
+    const book = state.books.find(b => b.id === bookId);
+    document.getElementById('readerBookTitle').textContent = book ? book.title : 'Story Stack eReader';
+    const status = document.getElementById('readerStatus');
+    const statusText = document.getElementById('readerStatusText');
+    const epubViewer = document.getElementById('epub-viewer');
+    const pdfPages = document.getElementById('pdf-pages');
+    epubViewer.style.display = 'none';
+    epubViewer.innerHTML = '';
+    pdfPages.innerHTML = '';
+
+    // Reset bookmark button + any previous book's auto-save listeners —
+    // otherwise switching books mid-session could leave a stale interval
+    // saving position under the wrong bookId, or the button visible
+    // before the new book has actually loaded.
+    document.getElementById('readerBookmarkBtn').style.display = 'none';
+    if (currentReaderCleanup) { currentReaderCleanup(); currentReaderCleanup = null; }
+    currentReaderContext = null;
+
+    // Terminal states (need the person to act, or something's genuinely
+    // wrong) replace the spinner+text entirely with a plain message.
+    // "Still working" states only update statusText so the spinner
+    // keeps spinning underneath rather than disappearing mid-wait.
+    function showTerminalMessage(html) {
+      status.style.display = 'block';
+      status.innerHTML = html;
+    }
+    function showLoadingMessage(text) {
+      status.style.display = 'block';
+      statusText.textContent = text;
+    }
+    function hideStatus() {
+      status.style.display = 'none';
+    }
+
+
+    // --- HARD GATE: never render a page of content — live or demo —
+    // unless state.ownedDigitalBookIds says this user actually paid for
+    // it. This is a UX convenience gate only; the real enforcement lives
+    // server-side in GET /api/reader/:bookId, which independently checks
+    // the purchases ledger before ever issuing a presigned file URL. ---
+    if (!state.user) {
+      showTerminalMessage(`Sign in to read this book.<br/><button class="btn btn-primary" style="margin-top:14px;" onclick="window.StoryStackAuth.signIn()">Sign in</button>`);
+      return;
+    }
+    if (!state.ownedDigitalBookIds.has(bookId)) {
+      showTerminalMessage(`
+        You haven't purchased the digital edition of "${book ? escapeHtml(book.title) : 'this book'}" yet.
+        <br/><button class="btn btn-primary" style="margin-top:14px;" onclick="StoryStack.startCheckout('${bookId}','digital')">Buy Digital Ebook${book && book.ebookPriceCents != null ? ' — $' + (book.ebookPriceCents/100).toFixed(2) : ''}</button>`);
+      return;
+    }
+
+
+    showLoadingMessage('Loading book…');
+
+
+    // Ask the backend for a short-lived presigned file URL — mirrors
+    // GET /api/reader/:bookId on the Story Stack API, which re-verifies
+    // ownership (and preorder release timing) server-side before issuing
+    // anything.
+    let fileUrl = null, fileType = 'pdf';
+    let networkUnreachable = false;
+    try {
+      const data = await apiFetch(`/api/reader/${bookId}?format=json`);
+      fileUrl = data.presignedUrl;
+      fileType = data.fileType || 'pdf';
+    } catch (e) {
+      // Distinguish "couldn't reach the API at all" (TypeError from a
+      // failed fetch() — e.g. API_BASE_URL misconfigured, offline) from
+      // "reached it, and it told us something specific" (a real HTTP
+      // error with a message, e.g. the preorder-not-released gate, or an
+      // ownership check failing). Only the former is safe to paper over
+      // with placeholder demo content — the latter has to be shown
+      // as-is, or real problems (like "this preorder isn't out yet")
+      // would silently look like everything's fine.
+      if (e instanceof TypeError) {
+        networkUnreachable = true;
+        console.warn('[reader] Could not reach the API, showing demo content:', e.message);
+      } else {
+        showTerminalMessage(escapeHtml(e.message || 'Unable to load this book right now.'));
+        return;
+      }
+    }
+
+
+    if (!fileUrl) {
+      if (!networkUnreachable) {
+        showTerminalMessage('Unable to load this book right now.');
+        return;
+      }
+      hideStatus();
+      pdfPages.innerHTML = `
+        <div style="max-width:60ch;margin:0 auto;background:var(--surface);padding:30px;border-radius:8px;">
+          <p><em>Demo preview — this is placeholder text standing in for the licensed EPUB/PDF, shown because the live API couldn't be reached from this preview.</em></p>
+          <p>${book ? escapeHtml(book.description) : ''}</p>
+        </div>`;
+      return;
+    }
+
+    // Fetch any saved reading position — used to resume where the person
+    // left off. A failure here isn't fatal to actually reading the book,
+    // so it's non-blocking and just starts from the beginning if it
+    // can't be fetched for any reason.
+    let savedLocation = null;
+    try {
+      const progress = await apiFetch(`/api/reader/${bookId}/progress`);
+      savedLocation = progress.location || null;
+    } catch (e) {
+      console.warn('[reader] Could not fetch saved reading position:', e.message);
+    }
+
+
+    try {
+      showLoadingMessage('Downloading book…');
+      const res = await fetch(fileUrl);
+      if (!res.ok) {
+        throw new Error(`S3 responded ${res.status} fetching the file — likely a CORS or permissions issue on the bucket.`);
+      }
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      // NOTE: status is intentionally NOT hidden here — the download
+      // finishing isn't the same as content being on screen yet. Hiding
+      // it here (as this used to do) left a gap where the viewer area
+      // was empty with zero loading feedback — the "white screen" bug —
+      // between the download finishing and the book actually rendering.
+      // It's only hidden once real content is confirmed rendered below.
+      showLoadingMessage('Rendering book…');
+
+
+      if (fileType === 'epub') {
+        await waitForGlobal('ePub', () => showLoadingMessage('Still loading the reader engine — hang tight on a slow connection…'));
+        epubViewer.style.display = 'block';
+        const epubBook = ePub(objectUrl);
+        const rendition = epubBook.renderTo('epub-viewer', { width:'100%', height:'100%' });
+        // Awaited — display() is async; without awaiting it, the loading
+        // state was being cleared before any content had actually
+        // painted, which is exactly what caused the white screen.
+        await rendition.display(savedLocation || undefined);
+        hideStatus();
+        setupEpubAutoSave(bookId, rendition);
+      } else {
+        await waitForGlobal('pdfjsLib', () => showLoadingMessage('Still loading the reader engine — hang tight on a slow connection…'));
+        // pdf.js requires its worker script location set explicitly —
+        // it doesn't reliably auto-detect this when loaded via a plain
+        // CDN <script> tag. Must match the exact same pdfjs-dist version
+        // as the main library load above.
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.worker.min.js';
+        const doc = await pdfjsLib.getDocument({ url: objectUrl }).promise;
+        let savedPage = 1;
+        if (savedLocation) {
+          try { savedPage = JSON.parse(savedLocation).page || 1; } catch (e) { /* ignore malformed saved location */ }
+        }
+        for (let n = 1; n <= doc.numPages; n++) {
+          const page = await doc.getPage(n);
+          const viewport = page.getViewport({ scale: 1.3 });
+          const canvas = document.createElement('canvas');
+          canvas.dataset.pageNumber = String(n);
+          canvas.width = viewport.width; canvas.height = viewport.height;
+          pdfPages.appendChild(canvas);
+          await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+          // First page painted — safe to reveal the content now instead
+          // of waiting for every remaining page to finish rendering.
+          if (n === 1) hideStatus();
+        }
+        if (savedPage > 1) {
+          const target = pdfPages.querySelector(`canvas[data-page-number="${savedPage}"]`);
+          if (target) target.scrollIntoView({ block: 'start' });
+        }
+        setupPdfAutoSave(bookId, pdfPages);
+      }
+      window.addEventListener('beforeunload', () => URL.revokeObjectURL(objectUrl));
+    } catch (e) {
+      // Previously always showed a generic message here regardless of
+      // what actually went wrong, with the real error only in the
+      // console — no use on mobile with no devtools access. Surface the
+      // real message on-screen instead, and specifically flag the most
+      // likely cause (a fetch() that fails with zero HTTP status at all,
+      // no res.ok check ever reached) as a probable CORS issue, since
+      // that's overwhelmingly the most common cause of a failure at
+      // exactly this step.
+      const isLikelyCors = e instanceof TypeError;
+      showTerminalMessage(escapeHtml(isLikelyCors
+        ? "Couldn't load the file from storage — this usually means the S3 bucket's CORS settings don't allow this site yet."
+        : (e.message || 'Unable to load this book right now.')));
+      console.error('[reader]', e);
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // READER — AUTO-SAVE / BOOKMARK
+  // ---------------------------------------------------------------
+  let currentReaderCleanup = null; // clears the previous book's listeners/intervals when a new one opens
+  let currentReaderContext = null; // { bookId, type: 'epub'|'pdf', rendition? } — used by the manual Bookmark button
+
+  // Manual "Bookmark this spot" button — saves immediately with visible
+  // confirmation, distinct from the silent periodic auto-save. Useful
+  // when someone wants to be certain their place is saved right now
+  // (e.g. right before closing the tab) rather than trusting the next
+  // debounce/interval cycle.
+  async function bookmarkCurrentPosition() {
+    const btn = document.getElementById('readerBookmarkBtn');
+    if (!currentReaderContext) return;
+    const original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Saving…';
+
+    let location = null;
+    if (currentReaderContext.type === 'epub') {
+      const loc = currentReaderContext.rendition.currentLocation();
+      if (loc && loc.start && loc.start.cfi) location = loc.start.cfi;
+    } else {
+      const canvases = Array.from(document.querySelectorAll('#pdf-pages canvas'));
+      const wrapTop = document.getElementById('readerCanvasWrap').getBoundingClientRect().top;
+      let best = canvases[0], bestDelta = Infinity;
+      for (const c of canvases) {
+        const delta = Math.abs(c.getBoundingClientRect().top - wrapTop);
+        if (delta < bestDelta) { bestDelta = delta; best = c; }
+      }
+      location = JSON.stringify({ type: 'pdf', page: best ? parseInt(best.dataset.pageNumber, 10) : 1 });
+    }
+
+    if (location) await saveReadingPosition(currentReaderContext.bookId, location);
+
+    btn.textContent = '✓ Saved!';
+    setTimeout(() => { btn.textContent = original; btn.disabled = false; }, 1500);
+  }
+
+  async function saveReadingPosition(bookId, location) {
+    try {
+      await apiFetch(`/api/reader/${bookId}/progress`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ location }),
+      });
+    } catch (e) {
+      console.warn('[reader] Could not save reading position:', e.message);
+    }
+  }
+
+  // Debounces saves so navigating quickly through several pages doesn't
+  // fire a network request per page — only the last position within a
+  // short window actually gets saved.
+  function debouncedSave(fn, delayMs) {
+    let timer = null;
+    return (...args) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => fn(...args), delayMs);
+    };
+  }
+
+  function setupEpubAutoSave(bookId, rendition) {
+    if (currentReaderCleanup) currentReaderCleanup();
+    currentReaderContext = { bookId, type: 'epub', rendition };
+    document.getElementById('readerBookmarkBtn').style.display = 'inline-block';
+
+    const save = debouncedSave((cfi) => saveReadingPosition(bookId, cfi), 2000);
+
+    const onRelocated = (location) => {
+      if (location && location.start && location.start.cfi) {
+        save(location.start.cfi);
+      }
+    };
+    rendition.on('relocated', onRelocated);
+
+    // Belt-and-suspenders periodic save in case 'relocated' doesn't fire
+    // for some reason (e.g. the person just leaves it open on one page).
+    const intervalId = setInterval(() => {
+      const loc = rendition.currentLocation();
+      if (loc && loc.start && loc.start.cfi) saveReadingPosition(bookId, loc.start.cfi);
+    }, 30000);
+
+    const onUnload = () => {
+      const loc = rendition.currentLocation();
+      if (loc && loc.start && loc.start.cfi) saveReadingPosition(bookId, loc.start.cfi);
+    };
+    window.addEventListener('beforeunload', onUnload);
+
+    currentReaderCleanup = () => {
+      clearInterval(intervalId);
+      window.removeEventListener('beforeunload', onUnload);
+    };
+  }
+
+  function setupPdfAutoSave(bookId, pdfPagesEl) {
+    if (currentReaderCleanup) currentReaderCleanup();
+    currentReaderContext = { bookId, type: 'pdf' };
+    document.getElementById('readerBookmarkBtn').style.display = 'inline-block';
+
+    function currentVisiblePage() {
+      const canvases = Array.from(pdfPagesEl.querySelectorAll('canvas'));
+      const wrap = document.getElementById('readerCanvasWrap');
+      const wrapTop = wrap.getBoundingClientRect().top;
+      // The page whose top is closest to (but not below) the top of the
+      // scroll container is treated as "currently reading."
+      let best = canvases[0];
+      let bestDelta = Infinity;
+      for (const c of canvases) {
+        const delta = Math.abs(c.getBoundingClientRect().top - wrapTop);
+        if (delta < bestDelta) { bestDelta = delta; best = c; }
+      }
+      return best ? parseInt(best.dataset.pageNumber, 10) : 1;
+    }
+
+    const save = debouncedSave(() => {
+      saveReadingPosition(bookId, JSON.stringify({ type: 'pdf', page: currentVisiblePage() }));
+    }, 2000);
+
+    const wrap = document.getElementById('readerCanvasWrap');
+    wrap.addEventListener('scroll', save);
+
+    const intervalId = setInterval(() => {
+      saveReadingPosition(bookId, JSON.stringify({ type: 'pdf', page: currentVisiblePage() }));
+    }, 30000);
+
+    const onUnload = () => {
+      saveReadingPosition(bookId, JSON.stringify({ type: 'pdf', page: currentVisiblePage() }));
+    };
+    window.addEventListener('beforeunload', onUnload);
+
+    currentReaderCleanup = () => {
+      wrap.removeEventListener('scroll', save);
+      clearInterval(intervalId);
+      window.removeEventListener('beforeunload', onUnload);
+    };
+  }
+
+
+  // ---------------------------------------------------------------
+  // PAGE 4 — ORDERS
+  // ---------------------------------------------------------------
+  function renderOrders() {
+    const el = document.getElementById('ordersList');
+    if (!state.user) { el.innerHTML = `<div class="empty-state">Sign in to see your orders.</div>`; return; }
+    if (state.orders.length === 0) { el.innerHTML = `<div class="empty-state">No orders yet — your Story Stack purchases will show up here.</div>`; return; }
+
+
+    const badgeClass = { processing:'status-processing', shipped:'status-shipped', delivered:'status-delivered' };
+
+
+    el.innerHTML = state.orders.map(o => `
+      <div class="order-row">
+        <div class="book-cover mini" style="background:var(--surface-2);"></div>
+        <div class="order-info">
+          <div style="font-weight:600;">${escapeHtml(o.bookTitle)}</div>
+          <div class="mono">${escapeHtml(String(o.id).slice(0, 8))} · ${o.type === 'print' ? 'Printed edition' : 'Digital ebook'} · ${o.date ? new Date(o.date).toLocaleDateString() : ''}</div>
+        </div>
+        <span class="status-badge ${badgeClass[o.status] || ''}">${escapeHtml(o.status)}</span>
+        ${o.tracking ? `<a class="tracking-link" target="_blank" rel="noopener" href="https://www.ups.com/track?tracknum=${encodeURIComponent(o.tracking)}">Track: ${escapeHtml(o.carrier)} ${escapeHtml(o.tracking)}</a>` : ''}
+        ${o.type === 'digital' && o.bookId ? `<button class="btn" onclick="StoryStack.navigateTo('reader', { bookId: '${o.bookId}' })">Read now</button>` : ''}
+      </div>
+    `).join('');
+  }
+
+
+  // ---------------------------------------------------------------
+  // PAGE 5 — AUTHOR HUB
+  // ---------------------------------------------------------------
+  // TEMPORARY DEBUG TOOL — see the matching backend route's comment
+  // (GET /api/author/whoami in authorController.js) for what this shows.
+  // Kicks off Stripe Connect onboarding (see stripeConnectController.js
+  // on the backend) and hands the browser off to Stripe's own hosted
+  // onboarding flow. Stripe redirects back to the backend when done,
+  // which then redirects into this page with ?stripe_onboarding=... —
+  // see the boot-time handling of that near the bottom of this script.
+  // ---------------------------------------------------------------
+  // AUTHOR HUB — MY BOOKS (list + inline edit)
+  // ---------------------------------------------------------------
+  let myBooksCache = []; // avoids re-fetching just to repopulate an edit form
+
+  async function renderMyBooks() {
+    const container = document.getElementById('myBooksList');
+    container.innerHTML = '<p style="color:var(--text-muted);">Loading your books…</p>';
+    try {
+      myBooksCache = await apiFetch('/api/author/books');
+    } catch (e) {
+      container.innerHTML = `<p style="color:var(--text-muted);">Could not load your books: ${escapeHtml(e.message)}</p>`;
+      return;
+    }
+
+    if (myBooksCache.length === 0) {
+      container.innerHTML = `<p style="color:var(--text-muted);">You haven't published anything yet — try the Publishing Wizard tab.</p>`;
+      return;
+    }
+
+    container.innerHTML = myBooksCache.map((b) => `
+      <div class="book-manage-row" id="bookRow-${b.id}">
+        <div class="book-manage-summary">
+          <div class="book-manage-thumb">${bookCoverHtml(b)}</div>
+          <span class="title">${escapeHtml(b.title)}</span>
+          <span class="mono">${formatBookPriceRange(b)}</span>
+          <span class="book-status-badge book-status-${b.status}">${escapeHtml(b.status)}</span>
+          <button type="button" class="btn" onclick="StoryStack.toggleBookEdit('${b.id}')">Edit</button>
+        </div>
+
+        <form class="book-edit-form" id="editForm-${b.id}" onsubmit="return StoryStack.submitBookEdit(event, '${b.id}')">
+          <div class="form-grid">
+            <div class="field">
+              <label for="edit-title-${b.id}">Title</label>
+              <input type="text" id="edit-title-${b.id}" value="${escapeHtml(b.title)}" required />
+            </div>
+            <div class="field">
+              <label for="edit-genre-${b.id}">Genre</label>
+              <input type="text" id="edit-genre-${b.id}" value="${escapeHtml(b.genre || '')}" />
+            </div>
+            <div class="field">
+              <label for="edit-ebookprice-${b.id}">Ebook Price (USD)</label>
+              <input type="number" id="edit-ebookprice-${b.id}" min="0" step="0.01" value="${b.ebookPriceCents != null ? (b.ebookPriceCents / 100).toFixed(2) : ''}" />
+            </div>
+            <div class="field">
+              <label for="edit-status-${b.id}">Listing status</label>
+              <select id="edit-status-${b.id}">
+                <option value="published" ${b.status === 'published' ? 'selected' : ''}>Published — visible in catalog</option>
+                <option value="archived" ${b.status === 'archived' ? 'selected' : ''}>Archived — hidden from catalog</option>
+              </select>
+            </div>
+          </div>
+
+          <div style="margin-top:14px;padding:14px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface-2);">
+            <p style="margin:0 0 10px;font-weight:600;font-size:.85rem;">Print pricing <span style="font-weight:400;color:var(--text-muted);">(only needed if print is available)</span></p>
+            <div class="form-grid">
+              <div class="field">
+                <label for="edit-lulu-${b.id}">Lulu Print Package ID</label>
+                <input type="text" id="edit-lulu-${b.id}" value="${escapeHtml(b.luluPodPackageId || '')}" placeholder="e.g. 0600X0900BWSTD..." />
+              </div>
+              <div class="field">
+                <label for="edit-pagecount-${b.id}">Page Count</label>
+                <input type="number" id="edit-pagecount-${b.id}" min="1" step="1" value="${b.printPageCount || ''}" />
+              </div>
+            </div>
+            <button type="button" class="btn btn-outline" style="margin-top:10px;" onclick="StoryStack.calculatePrintCost('${b.id}')">Calculate Print Cost</button>
+            <p class="form-note" id="editPrintCostNote-${b.id}">${b.printBaseCostCents ? `Last calculated cost: $${(b.printBaseCostCents / 100).toFixed(2)}` : ''}</p>
+            <div class="field" style="margin-top:10px;max-width:220px;">
+              <label for="edit-printprice-${b.id}">Print Price (USD)</label>
+              <input type="number" id="edit-printprice-${b.id}" min="0" step="0.01" value="${b.printPriceCents != null ? (b.printPriceCents / 100).toFixed(2) : ''}" />
+            </div>
+          </div>
+
+          <div class="field" style="margin-top:14px;">
+            <label for="edit-desc-${b.id}">Description</label>
+            <textarea id="edit-desc-${b.id}" rows="3">${escapeHtml(b.description || '')}</textarea>
+          </div>
+          <div style="margin-top:14px;display:flex;gap:20px;flex-wrap:wrap;">
+            <label class="checkbox-field"><input type="checkbox" id="edit-digital-${b.id}" ${b.digital ? 'checked' : ''} /> Digital available</label>
+            <label class="checkbox-field"><input type="checkbox" id="edit-print-${b.id}" ${b.print ? 'checked' : ''} /> Print available</label>
+          </div>
+          <div class="book-edit-actions">
+            <button type="submit" class="btn btn-primary">Save Changes</button>
+            <button type="button" class="btn btn-outline" onclick="StoryStack.toggleBookEdit('${b.id}')">Cancel</button>
+          </div>
+          <p class="form-note" id="editNote-${b.id}"></p>
+        </form>
+
+        <!-- Not nested inside the form above (file inputs + their own
+             submit action can't live inside another <form>) — toggled
+             open/closed together with it via the shared "book-edit-form"
+             class and id pattern instead. -->
+        <div class="book-edit-form" id="replacePanel-${b.id}">
+          <p style="font-weight:600;font-size:.85rem;margin-bottom:4px;">Replace files</p>
+          <p style="color:var(--text-muted);font-size:.82rem;margin-top:0;">Only upload what you want to swap out — anything left blank keeps its current file.</p>
+          <div class="upload-grid">
+            <label class="upload-slot" id="replace-slot-ebookCoverImage-${b.id}">
+              <input type="file" accept="image/*" onchange="StoryStack.handleReplaceFileSlot(this,'${b.id}','ebookCoverImage')" />
+              Ebook Cover Image
+            </label>
+            <label class="upload-slot" id="replace-slot-printCover-${b.id}">
+              <input type="file" accept="application/pdf" onchange="StoryStack.handleReplaceFileSlot(this,'${b.id}','printCover')" />
+              Print Cover PDF
+            </label>
+            <label class="upload-slot" id="replace-slot-epub-${b.id}">
+              <input type="file" accept=".epub,application/epub+zip" onchange="StoryStack.handleReplaceFileSlot(this,'${b.id}','epub')" />
+              EPUB Manuscript
+            </label>
+            <label class="upload-slot" id="replace-slot-printInterior-${b.id}">
+              <input type="file" accept="application/pdf" onchange="StoryStack.handleReplaceFileSlot(this,'${b.id}','printInterior')" />
+              Print Interior PDF
+            </label>
+          </div>
+          <div class="progress-track" id="replaceProgressTrack-${b.id}"><div class="progress-fill" id="replaceProgressFill-${b.id}"></div></div>
+          <div class="book-edit-actions">
+            <button type="button" class="btn btn-primary" id="replaceFilesBtn-${b.id}" onclick="StoryStack.submitReplaceFiles('${b.id}')">Upload New Files</button>
+          </div>
+          <p class="form-note" id="replaceFilesNote-${b.id}"></p>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  function toggleBookEdit(bookId) {
+    document.getElementById(`editForm-${bookId}`).classList.toggle('open');
+    document.getElementById(`replacePanel-${bookId}`).classList.toggle('open');
+  }
+
+  async function submitBookEdit(evt, bookId) {
+    evt.preventDefault();
+    const note = document.getElementById(`editNote-${bookId}`);
+    const isDigital = document.getElementById(`edit-digital-${bookId}`).checked;
+    const isPrint = document.getElementById(`edit-print-${bookId}`).checked;
+    const luluPodPackageId = document.getElementById(`edit-lulu-${bookId}`).value.trim();
+    const pageCount = document.getElementById(`edit-pagecount-${bookId}`).value;
+    const ebookPrice = parseFloat(document.getElementById(`edit-ebookprice-${bookId}`).value || '0');
+    const printPrice = parseFloat(document.getElementById(`edit-printprice-${bookId}`).value || '0');
+
+    if (!isDigital && !isPrint) {
+      note.textContent = 'At least one of digital or print must stay enabled.';
+      return false;
+    }
+    if (isDigital && !ebookPrice) {
+      note.textContent = 'An ebook price is required to keep digital available.';
+      return false;
+    }
+    if (isPrint && !luluPodPackageId) {
+      note.textContent = 'A Lulu Print Package ID is required to keep print available.';
+      return false;
+    }
+    if (isPrint && (!pageCount || parseInt(pageCount, 10) < 1)) {
+      note.textContent = 'A valid page count is required to keep print available.';
+      return false;
+    }
+    if (isPrint && !printPrice) {
+      note.textContent = 'A print price is required to keep print available — use "Calculate Print Cost" to see the minimum.';
+      return false;
+    }
+
+    const payload = {
+      title: document.getElementById(`edit-title-${bookId}`).value.trim(),
+      description: document.getElementById(`edit-desc-${bookId}`).value.trim(),
+      genre: document.getElementById(`edit-genre-${bookId}`).value.trim(),
+      status: document.getElementById(`edit-status-${bookId}`).value,
+      isDigitalAvailable: isDigital,
+      ebookPriceCents: isDigital ? Math.round(ebookPrice * 100) : undefined,
+      isPrintAvailable: isPrint,
+      printPriceCents: isPrint ? Math.round(printPrice * 100) : undefined,
+      printPageCount: isPrint ? pageCount : undefined,
+      luluPodPackageId,
+    };
+
+    note.textContent = 'Saving…';
+    try {
+      await apiFetch(`/api/author/books/${bookId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      note.textContent = '';
+      renderMyBooks(); // re-render from the server's saved state
+    } catch (e) {
+      note.textContent = e.message || 'Could not save changes.';
+    }
+    return false;
+  }
+
+  async function connectStripe() {
+    const btn = document.getElementById('connectStripeBtn');
+    const note = document.getElementById('connectStripeNote');
+    btn.disabled = true;
+    note.textContent = 'Opening Stripe…';
+    try {
+      const { onboardingUrl, alreadyConnected } = await apiFetch('/api/author/stripe/connect', { method: 'POST' });
+
+      // IMPORTANT: this must open a real new browser tab, not navigate
+      // in place. Google Sites embeds this page inside an iframe, and
+      // Stripe's own onboarding/dashboard pages refuse to render inside
+      // any iframe at all (they block framing outright, same reasoning
+      // as our own reader page's clickjacking protection) — navigating
+      // window.location here would send the iframe itself to a page
+      // Stripe deliberately won't display, which is exactly the error
+      // you were seeing.
+      const popup = window.open(onboardingUrl, '_blank', 'noopener,noreferrer');
+
+      btn.disabled = false;
+
+      if (!popup) {
+        // Browser/embed context blocked the popup outright — fall back
+        // to a plain link the person can tap themselves.
+        note.innerHTML = `Your browser blocked the popup. <a href="${onboardingUrl}" target="_blank" rel="noopener noreferrer">Tap here to continue to Stripe</a>.`;
+        return;
+      }
+
+      note.textContent = alreadyConnected
+        ? "Opened your Stripe dashboard in a new tab."
+        : "Opened Stripe in a new tab — finish up there, then come back and tap \"Refresh status\" below.";
+    } catch (e) {
+      btn.disabled = false;
+      note.textContent = e.message || 'Could not start Stripe onboarding — please try again.';
+    }
+  }
+
+  // Checked whenever the dashboard renders, so the button/status text is
+  // accurate before the author clicks anything — previously the button
+  // always said "Connect Payouts with Stripe" even for an author who was
+  // already fully verified, so clicking it just bounced them straight
+  // back with no explanation (an account_onboarding link has nothing
+  // left to show once every requirement is already satisfied).
+  async function refreshStripeConnectStatus() {
+    const statusText = document.getElementById('stripeConnectStatusText');
+    const note = document.getElementById('connectStripeNote');
+    const btn = document.getElementById('connectStripeBtn');
+    statusText.textContent = 'Checking your Stripe status…';
+    try {
+      const { connected } = await apiFetch('/api/author/stripe/status');
+      if (connected) {
+        statusText.textContent = "✓ Your Stripe account is connected and ready to receive payouts.";
+        btn.textContent = 'Manage Stripe Account';
+        note.textContent = '';
+      } else {
+        statusText.textContent = 'Link a Stripe account to get paid — this is required before anyone can buy your books.';
+        btn.textContent = 'Connect Payouts with Stripe';
+        note.textContent = "Not connected yet — if you just finished on Stripe, give it a few seconds and tap \"Refresh status\" again.";
+      }
+    } catch (e) {
+      statusText.textContent = 'Link a Stripe account to get paid — this is required before anyone can buy your books.';
+      btn.textContent = 'Connect Payouts with Stripe';
+    }
+  }
+
+  async function checkAuthorStatus() {
+    const pre = document.getElementById('authorStatusDebug');
+    pre.style.display = 'block';
+    pre.textContent = 'Checking…';
+    try {
+      const data = await apiFetch('/api/author/whoami');
+      pre.textContent = JSON.stringify(data, null, 2) +
+        '\n\ntokenClaims = what your current session thinks right now' +
+        '\nliveClaims = what Firebase actually has on file for you';
+    } catch (e) {
+      pre.textContent = 'Check failed: ' + e.message;
+    }
+  }
+
+  async function submitAuthorRegistration(evt) {
+    evt.preventDefault();
+    const displayName = document.getElementById('regDisplayName').value.trim();
+    const bio = document.getElementById('regBio').value.trim();
+    const btn = document.getElementById('registerAuthorBtn');
+    const note = document.getElementById('registerAuthorNote');
+
+
+    if (!displayName) { note.textContent = 'Author name is required.'; return false; }
+
+
+    btn.disabled = true;
+    note.textContent = 'Registering…';
+
+
+    const result = await window.StoryStackAuth.registerAsAuthor(displayName, bio);
+
+
+    btn.disabled = false;
+    if (result.ok) {
+      note.textContent = result.pending ? result.error : '';
+      renderAuthorHub(); // setUser already refreshed state.user.isAuthor — swap to the real hub if it's ready
+    } else {
+      note.textContent = result.error || 'Registration failed — please try again.';
+    }
+    return false;
+  }
+
+
+  function setAuthorView(view) {
+    state.authorView = view;
+    document.getElementById('tab-dashboard').classList.toggle('active', view === 'dashboard');
+    document.getElementById('tab-mybooks').classList.toggle('active', view === 'mybooks');
+    document.getElementById('tab-publish').classList.toggle('active', view === 'publish');
+    document.getElementById('authorView-dashboard').style.display = view === 'dashboard' ? 'block' : 'none';
+    document.getElementById('authorView-mybooks').style.display = view === 'mybooks' ? 'block' : 'none';
+    document.getElementById('authorView-publish').style.display = view === 'publish' ? 'block' : 'none';
+    if (view === 'mybooks') renderMyBooks();
+  }
+
+
+  async function renderAuthorHub() {
+    const gate = document.getElementById('authorRegisterGate');
+    const main = document.getElementById('authorHubMain');
+
+
+    if (!state.user) {
+      // Shouldn't normally be reachable (setUser redirects signed-out
+      // visitors away from this page), but keep a safe fallback.
+      gate.style.display = 'none';
+      main.style.display = 'none';
+      return;
+    }
+
+
+    if (!state.user.isAuthor) {
+      gate.style.display = 'block';
+      main.style.display = 'none';
+      return;
+    }
+
+
+    gate.style.display = 'none';
+    main.style.display = 'block';
+
+    refreshStripeConnectStatus();
+
+    let stats = MOCK_AUTHOR_STATS;
+    try { stats = await apiFetch('/api/author/stats'); }
+    catch (e) { console.warn('[author hub] Falling back to demo stats:', e.message); }
+
+
+    document.getElementById('authorMetrics').innerHTML = `
+      <div class="metric-card">
+        <div class="metric-label">Lifetime Earnings</div>
+        <div class="metric-value">$${(stats.lifetimeEarningsCents/100).toFixed(2)}</div>
+        <div class="metric-sub">after Story Stack's marketplace commission</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Outstanding Royalties</div>
+        <div class="metric-value">$${(stats.outstandingRoyaltiesCents/100).toFixed(2)}</div>
+        <div class="metric-sub">next Stripe payout pending</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Print Copies Sold</div>
+        <div class="metric-value">${stats.printCopiesSold}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Digital Copies Sold</div>
+        <div class="metric-value">${stats.digitalCopiesSold}</div>
+      </div>
+    `;
+    setAuthorView(state.authorView);
+  }
+
+
+  const publishFiles = {}; // fieldKey -> File
+
+  // Maps a calculatePrintCost() "context" to its element IDs — 'pub' for
+  // the Publishing Wizard's fixed IDs, or a bookId string for My Books'
+  // per-book dynamic IDs, so this one function works in both places.
+  function printCostElementIds(context) {
+    if (context === 'pub') {
+      return { luluId: 'pubLuluPackageId', pageCount: 'pubPageCount', note: 'pubPrintCostNote', printPrice: 'pubPrintPrice' };
+    }
+    return {
+      luluId: `edit-lulu-${context}`,
+      pageCount: `edit-pagecount-${context}`,
+      note: `editPrintCostNote-${context}`,
+      printPrice: `edit-printprice-${context}`,
+    };
+  }
+
+  // Calls the real Lulu cost-calculation API (see printCostController.js
+  // on the backend) so an author knows what a book will actually cost to
+  // print & ship BEFORE committing to a print price. This is a
+  // convenience display only — the backend re-calculates and enforces
+  // the same floor independently at publish/save time, since a
+  // client-side-only check could be bypassed by calling the API directly.
+  async function calculatePrintCost(context) {
+    const ids = printCostElementIds(context);
+    const luluPodPackageId = document.getElementById(ids.luluId).value.trim();
+    const pageCount = document.getElementById(ids.pageCount).value;
+    const note = document.getElementById(ids.note);
+
+    if (!luluPodPackageId) { note.textContent = 'Enter a Lulu Print Package ID first.'; return; }
+    if (!pageCount || parseInt(pageCount, 10) < 1) { note.textContent = 'Enter a valid page count first.'; return; }
+
+    note.textContent = 'Calculating…';
+    try {
+      const data = await apiFetch('/api/author/print-cost-estimate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ luluPodPackageId, pageCount }),
+      });
+      const dollars = (data.estimatedCostCents / 100).toFixed(2);
+      note.textContent = `Estimated cost to print & ship one copy: $${dollars}. Your print price must be at least this amount.`;
+
+      const printPriceInput = document.getElementById(ids.printPrice);
+      printPriceInput.min = dollars;
+      if (!printPriceInput.value || parseFloat(printPriceInput.value) < parseFloat(dollars)) {
+        printPriceInput.value = dollars;
+      }
+    } catch (e) {
+      note.textContent = e.message || 'Could not calculate print cost.';
+    }
+  }
+  function handleFileSlot(input, slotId) {
+    const file = input.files[0];
+    const slot = document.getElementById(slotId);
+    if (!file) return;
+    const key = slotId.replace('slot-', '');
+    publishFiles[key] = file;
+    slot.classList.add('filled');
+    slot.lastChild.textContent ? null : null;
+    slot.childNodes[slot.childNodes.length - 1].textContent = `✓ ${file.name}`;
+  }
+
+
+  // multipart upload with a real progress bar via XMLHttpRequest (fetch
+  // doesn't expose upload progress events).
+  function submitPublishForm(evt) {
+    evt.preventDefault();
+    const title = document.getElementById('pubTitle').value.trim();
+    const genre = document.getElementById('pubGenre').value;
+    const ebookPrice = parseFloat(document.getElementById('pubEbookPrice').value || '0');
+    const printPrice = parseFloat(document.getElementById('pubPrintPrice').value || '0');
+    const pageCount = document.getElementById('pubPageCount').value;
+    const luluPodPackageId = document.getElementById('pubLuluPackageId').value.trim();
+    const note = document.getElementById('publishNote');
+
+
+    if (!title) { note.textContent = 'Title is required.'; return false; }
+    if (!publishFiles.epub && !(publishFiles.printInterior && publishFiles.printCover)) {
+      note.textContent = 'Upload an EPUB manuscript, or both print files, before publishing.';
+      return false;
+    }
+    const wantsDigital = !!publishFiles.epub;
+    const wantsPrint = !!(publishFiles.printInterior && publishFiles.printCover);
+    if (wantsDigital && !ebookPrice) {
+      note.textContent = 'An ebook price is required when uploading an EPUB.';
+      return false;
+    }
+    if (wantsPrint && !luluPodPackageId) {
+      note.textContent = 'A Lulu Print Package ID is required when uploading print files — find it in your Lulu account.';
+      return false;
+    }
+    if (wantsPrint && (!pageCount || parseInt(pageCount, 10) < 1)) {
+      note.textContent = 'A valid page count is required for print — Lulu needs it to calculate cost and print the book.';
+      return false;
+    }
+    if (wantsPrint && !printPrice) {
+      note.textContent = 'A print price is required when uploading print files — use "Calculate Print Cost" to see the minimum.';
+      return false;
+    }
+
+
+    const formData = new FormData();
+    formData.append('title', title);
+    formData.append('genre', genre);
+    formData.append('isDigitalAvailable', String(wantsDigital));
+    if (wantsDigital) formData.append('ebookPriceCents', String(Math.round(ebookPrice * 100)));
+    formData.append('isPrintAvailable', String(wantsPrint));
+    if (wantsPrint) {
+      formData.append('luluPodPackageId', luluPodPackageId);
+      formData.append('printPageCount', pageCount);
+      formData.append('printPriceCents', String(Math.round(printPrice * 100)));
+    }
+    if (publishFiles.epub) formData.append('epub', publishFiles.epub);
+    if (publishFiles.printInterior) formData.append('printInterior', publishFiles.printInterior);
+    if (publishFiles.printCover) formData.append('printCover', publishFiles.printCover);
+    if (publishFiles.ebookCover) formData.append('ebookCoverImage', publishFiles.ebookCover);
+
+
+    const track = document.getElementById('uploadProgressTrack');
+    const fill = document.getElementById('uploadProgressFill');
+    const submitBtn = document.getElementById('publishSubmitBtn');
+    track.classList.add('active'); fill.style.width = '0%';
+    submitBtn.disabled = true;
+    note.textContent = 'Uploading…';
+
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${API_BASE_URL}/api/author/publish`);
+    if (state.user && state.user.idToken) xhr.setRequestHeader('Authorization', `Bearer ${state.user.idToken}`);
+
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) fill.style.width = `${Math.round((e.loaded / e.total) * 100)}%`;
+    };
+    xhr.onload = () => {
+      submitBtn.disabled = false;
+      if (xhr.status >= 200 && xhr.status < 300) {
+        note.textContent = `"${title}" was published to Story Stack.`;
+        fill.style.width = '100%';
+        document.getElementById('publishForm').reset();
+        Object.keys(publishFiles).forEach(k => delete publishFiles[k]);
+        document.querySelectorAll('.upload-slot').forEach(s => s.classList.remove('filled'));
+      } else {
+        note.textContent = `Publish failed (${xhr.status}). This preview may not be wired to a live backend yet.`;
+      }
+    };
+    xhr.onerror = () => {
+      submitBtn.disabled = false;
+      note.textContent = 'Publish failed — could not reach the Story Stack API from this preview.';
+    };
+    xhr.send(formData);
+    return false;
+  }
+
+
+  // ---------------------------------------------------------------
+  // AUTHOR HUB — REPUBLISH (replace files on an existing book)
+  // ---------------------------------------------------------------
+  const replaceFilesState = {}; // bookId -> { fieldKey: File }
+
+  function handleReplaceFileSlot(input, bookId, fieldKey) {
+    const file = input.files[0];
+    if (!file) return;
+    if (!replaceFilesState[bookId]) replaceFilesState[bookId] = {};
+    replaceFilesState[bookId][fieldKey] = file;
+
+    const slot = document.getElementById(`replace-slot-${fieldKey}-${bookId}`);
+    slot.classList.add('filled');
+    slot.childNodes[slot.childNodes.length - 1].textContent = `✓ ${file.name}`;
+  }
+
+  function submitReplaceFiles(bookId) {
+    const pending = replaceFilesState[bookId] || {};
+    const note = document.getElementById(`replaceFilesNote-${bookId}`);
+
+    if (Object.keys(pending).length === 0) {
+      note.textContent = 'Choose at least one file to upload first.';
+      return;
+    }
+
+    const formData = new FormData();
+    Object.entries(pending).forEach(([fieldKey, file]) => formData.append(fieldKey, file));
+
+    const track = document.getElementById(`replaceProgressTrack-${bookId}`);
+    const fill = document.getElementById(`replaceProgressFill-${bookId}`);
+    const btn = document.getElementById(`replaceFilesBtn-${bookId}`);
+    track.classList.add('active'); fill.style.width = '0%';
+    btn.disabled = true;
+    note.textContent = 'Uploading…';
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('PATCH', `${API_BASE_URL}/api/author/books/${bookId}/files`);
+    if (state.user && state.user.idToken) xhr.setRequestHeader('Authorization', `Bearer ${state.user.idToken}`);
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) fill.style.width = `${Math.round((e.loaded / e.total) * 100)}%`;
+    };
+    xhr.onload = () => {
+      btn.disabled = false;
+      if (xhr.status >= 200 && xhr.status < 300) {
+        fill.style.width = '100%';
+        note.textContent = 'Files updated.';
+        delete replaceFilesState[bookId];
+        renderMyBooks(); // re-render so the cover thumbnail reflects the new file immediately
+      } else {
+        // Surface the backend's actual error message rather than a
+        // generic status-code-only failure.
+        let message = `Upload failed (${xhr.status}).`;
+        try {
+          const data = JSON.parse(xhr.responseText);
+          if (data.error) message = data.error;
+        } catch (e) { /* response wasn't JSON — keep the generic message */ }
+        note.textContent = message;
+      }
+    };
+    xhr.onerror = () => {
+      btn.disabled = false;
+      note.textContent = 'Upload failed — could not reach the Story Stack API.';
+    };
+    xhr.send(formData);
+  }
+
+
+  // ---------------------------------------------------------------
+  // UTIL
+  // ---------------------------------------------------------------
+  function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  // Ebook and print now have independent prices — show the lower of the
+  // two (whichever variants actually exist) as the catalog card's
+  // headline price, with "From" when both exist and differ.
+  function formatBookPriceRange(book) {
+    const prices = [book.ebookPriceCents, book.printPriceCents].filter((p) => p != null);
+    if (prices.length === 0) return '';
+    const lowest = Math.min(...prices);
+    const showFrom = prices.length > 1 && prices[0] !== prices[1];
+    return `${showFrom ? 'From ' : ''}$${(lowest / 100).toFixed(2)}`;
+  }
+
+  // Renders a cover <img> pointed straight at GET /api/books/:id/cover
+  // (a redirect to a presigned S3 URL — see catalogController.js) when
+  // the book has one, always paired with a hidden spine-mark placeholder
+  // as a sibling. If the image genuinely fails to load (network blip, or
+  // the file was deleted server-side after this page loaded), onerror
+  // swaps visibility over to that placeholder instead of showing a
+  // broken-image icon.
+  // epub.js and pdf.js load via <script defer> in <head> from a CDN —
+  // on a slow connection (common on mobile), the reader page can try to
+  // use ePub()/pdfjsLib before the download finishes, throwing a raw
+  // "ePub is not defined" ReferenceError that has nothing to do with the
+  // actual book file. Poll indefinitely for the global to show up rather
+  // than giving up after a fixed timeout — a slow connection should
+  // eventually finish loading a ~100KB script rather than be treated as a
+  // hard failure. onSlow (optional) fires once after 5s so the UI can
+  // reassure the person it's still working rather than looking frozen.
+  function waitForGlobal(name, onSlow) {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      let slowNotified = false;
+      (function poll() {
+        if (typeof window[name] !== 'undefined') return resolve();
+        if (!slowNotified && onSlow && Date.now() - start > 5000) {
+          slowNotified = true;
+          onSlow();
+        }
+        setTimeout(poll, 150);
+      })();
+    });
+  }
+
+  function bookCoverHtml(book) {
+    const placeholder = `<span class="spine-mark" style="${book.hasCover ? 'display:none;' : ''}"><span></span><span></span><span></span><span></span><span></span></span>`;
+    if (!book.hasCover) return placeholder;
+    const img = `<img src="${API_BASE_URL}/api/books/${book.id}/cover" alt="" loading="lazy" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" />`;
+    return img + placeholder;
+  }
+
+
+  // ---------------------------------------------------------------
+  // PUBLIC API + BOOT
+  // ---------------------------------------------------------------
+  window.StoryStack = {
+    navigateTo, toggleTheme, setUser, renderCatalog,
+    startCheckout, submitReview, setAuthorView, handleFileSlot, submitPublishForm,
+    showAuthError, hideAuthError, showBanner, hideBanner,
+    submitAuthorRegistration, checkAuthorStatus, connectStripe, refreshStripeConnectStatus,
+    toggleBookEdit, submitBookEdit, handleReplaceFileSlot, submitReplaceFiles, calculatePrintCost,
+    bookmarkCurrentPosition
+  };
+
+
+  initTheme();
+  loadBooks();
+  renderAuthArea();
+
+
+  // If we've just been bounced back from Stripe Checkout (success_url is
+  // `${CHECKOUT_SUCCESS_URL}?session_id={CHECKOUT_SESSION_ID}`), land on
+  // Orders instead of the catalog and clean the URL. Ownership itself
+  // refreshes via setUser -> loadOwnedDigital once Firebase auth resolves;
+  // the webhook that actually marks the purchase 'paid' may still be a
+  // second or two behind, so this is a best-effort landing, not a guarantee.
+  const postCheckoutSessionId = new URLSearchParams(window.location.search).get('session_id');
+  const stripeOnboardingStatus = new URLSearchParams(window.location.search).get('stripe_onboarding');
+
+  if (postCheckoutSessionId) {
+    history.replaceState(null, '', window.location.pathname);
+    navigateTo('orders');
+  } else if (stripeOnboardingStatus) {
+    history.replaceState(null, '', window.location.pathname);
+    navigateTo('author');
+    if (stripeOnboardingStatus === 'complete') {
+      showBanner("Stripe account connected — you're all set to receive payouts.");
+    } else {
+      showBanner('Stripe onboarding is still incomplete — click "Connect Payouts with Stripe" again to finish up.');
+    }
+  } else {
+    navigateTo('catalog');
+  }
+})();
+</script>
+</body>
+</html>
